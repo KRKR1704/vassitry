@@ -1,0 +1,10 @@
+python-dotenv==1.0.1
+SpeechRecognition==3.10.4
+PyAudio==0.2.14
+pyttsx3==2.90
+pvporcupine==3.0.2     # if using Porcupine (requires access key)
+openwakeword==0.6.0    # optional: open-source wake word engine
+sounddevice==0.4.7      # needed by openwakeword
+numpy==1.26.4
+spacy==3.7.5            # for future NLP
+# en_core_web_sm model is downloaded separately
