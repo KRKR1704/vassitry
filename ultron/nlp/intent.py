@@ -5,17 +5,16 @@ from urllib.parse import urlparse
 
 @dataclass
 class IntentResult:
-    intent: str
-    entity: str | None
+    intent: str          # "open_site" | "open_app" | "unknown"
+    entity: str | None   # site domain or app name
 
-# --- Website aliases (unchanged/expand as you like) ---
-COMMON_MAP = {
+# Friendly site aliases (extend as you like)
+COMMON_SITES = {
     "google": "google.com",
     "gmail": "mail.google.com",
     "youtube": "youtube.com",
     "you tube": "youtube.com",
     "yt": "youtube.com",
-    "youtube music": "music.youtube.com",
     "github": "github.com",
     "stack overflow": "stackoverflow.com",
     "stackoverflow": "stackoverflow.com",
@@ -28,10 +27,13 @@ COMMON_MAP = {
     "maps": "maps.google.com",
     "drive": "drive.google.com",
     "docs": "docs.google.com",
+    "best buy": "bestbuy.com",
+    "open ai": "openai.com",
 }
 
-# --- Browser app aliases (NEW) ---
-APP_BROWSER_ALIASES = {
+# Common desktop apps (aliases -> canonical token)
+APP_ALIASES = {
+    # Browsers
     "chrome": "chrome",
     "google chrome": "chrome",
     "edge": "edge",
@@ -42,9 +44,28 @@ APP_BROWSER_ALIASES = {
     "opera": "opera",
     "default browser": "default",
     "browser": "default",
+    # Editors / IDEs
+    "notepad": "notepad",
+    "wordpad": "wordpad",
+    "visual studio code": "vscode",
+    "vs code": "vscode",
+    "vscode": "vscode",
+    "pycharm": "pycharm",
+    "visual studio": "visualstudio",
+    # Media / chat
+    "spotify": "spotify",
+    "vlc": "vlc",
+    "discord": "discord",
+    "slack": "slack",
+    "steam": "steam",
+    # Utilities
+    "calculator": "calc",
+    "calc": "calc",
+    "paint": "mspaint",
+    "snipping tool": "snippingtool",
 }
 
-OPEN_TRIGGERS = r"(open|go to|launch|start|navigate to|please open|can you open|open up)"
+OPEN_TRIGGERS = r"(open|launch|start|run|please open|can you open|open up)"
 
 URL_OR_DOMAIN = re.compile(
     r"(?P<url>(?:https?://)?(?:www\.)?[a-z0-9\-]+(?:\.[a-z0-9\-]+)+(?:/[^\s]*)?)",
@@ -53,37 +74,36 @@ URL_OR_DOMAIN = re.compile(
 
 FILLERS = re.compile(r"\b(the|a|an|please|website|site|page|app|application)\b", re.IGNORECASE)
 
+
 def _normalize(text: str) -> str:
     t = text.lower().strip()
     t = t.replace(" you tube", " youtube")
+    t = t.replace(" stack overflow", " stackoverflow")
     t = t.replace(" dot com", ".com")
     t = t.replace(" . com", ".com")
     t = re.sub(r"\s+", " ", t)
     return t
 
-def _alias_lookup(s: str) -> str | None:
-    if s in COMMON_MAP:
-        return COMMON_MAP[s]
-    keys = list(COMMON_MAP.keys())
-    match = get_close_matches(s, keys, n=1, cutoff=0.86)
-    if match:
-        return COMMON_MAP[match[0]]
-    return None
 
-def _browser_app_lookup(s: str) -> str | None:
-    # exact
-    if s in APP_BROWSER_ALIASES:
-        return APP_BROWSER_ALIASES[s]
-    # try two-word forms (e.g., "google chrome")
-    for k, v in APP_BROWSER_ALIASES.items():
-        if s == k:
-            return v
-    # fuzzy-ish
-    keys = list(APP_BROWSER_ALIASES.keys())
+def _site_alias(s: str) -> str | None:
+    if s in COMMON_SITES:
+        return COMMON_SITES[s]
+    keys = list(COMMON_SITES.keys())
     m = get_close_matches(s, keys, n=1, cutoff=0.86)
     if m:
-        return APP_BROWSER_ALIASES[m[0]]
+        return COMMON_SITES[m[0]]
     return None
+
+
+def _app_alias(s: str) -> str | None:
+    if s in APP_ALIASES:
+        return APP_ALIASES[s]
+    keys = list(APP_ALIASES.keys())
+    m = get_close_matches(s, keys, n=1, cutoff=0.86)
+    if m:
+        return APP_ALIASES[m[0]]
+    return None
+
 
 def parse_intent(text: str) -> IntentResult:
     if not text:
@@ -91,11 +111,7 @@ def parse_intent(text: str) -> IntentResult:
 
     t = _normalize(text)
 
-    # 0) Pure app open phrases without explicit "open" (e.g., "chrome")
-    if t in APP_BROWSER_ALIASES:
-        return IntentResult("open_app", APP_BROWSER_ALIASES[t])
-
-    # 1) If a URL/domain appears anywhere, treat as website
+    # 0) If a URL/domain appears anywhere, treat as open_site
     m = URL_OR_DOMAIN.search(t)
     if m:
         raw = m.group("url").rstrip(".,!?")
@@ -105,20 +121,25 @@ def parse_intent(text: str) -> IntentResult:
         host_or_path = parsed.netloc or parsed.path.lstrip("/")
         if host_or_path:
             site = re.sub(r"^www\.", "", host_or_path)
-            alias = _alias_lookup(site)
+            alias = _site_alias(site)
             site = alias if alias else site
             return IntentResult("open_site", site)
 
-    # 2) Look for "open ... <object>"
+    # 1) Pure app name without "open" (e.g., "chrome", "notepad")
+    app = _app_alias(t)
+    if app:
+        return IntentResult("open_app", app)
+
+    # 2) "open ..." command
     cmd = re.search(rf"{OPEN_TRIGGERS}\s+(?P<object>.+)$", t)
     if cmd:
         obj = cmd.group("object").strip().rstrip(".,!?")
-        # Check if they meant a browser app first
-        app = _browser_app_lookup(obj)
+        # Try app first
+        app = _app_alias(obj)
         if app:
             return IntentResult("open_app", app)
 
-        # Website cleanup
+        # Else treat as site
         obj = FILLERS.sub(" ", obj)
         obj = re.sub(r"\s+", " ", obj).strip()
 
@@ -129,14 +150,15 @@ def parse_intent(text: str) -> IntentResult:
         tokens = obj.split()
         if len(tokens) >= 2:
             two = " ".join(tokens[:2])
-            alias = _alias_lookup(two)
+            alias = _site_alias(two)
             if alias:
                 return IntentResult("open_site", alias)
 
-        alias = _alias_lookup(tokens[0])
+        alias = _site_alias(tokens[0])
         if alias:
             return IntentResult("open_site", alias)
 
+        # fallback: assume it's a site term like "facebook"
         return IntentResult("open_site", obj)
 
     return IntentResult("unknown", None)
