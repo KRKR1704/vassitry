@@ -21,6 +21,7 @@ UltronAssistant/
 │   │   ├── __init__.py
 │   │   ├── browser.py       # Open websites / browsers
 │   │   └── system.py        # (Future: shutdown PC, launch apps, etc.)
+│   │   └── gemini.py        # ai integration
 │   │
 │   └── utils/               # Helpers (optional future expansion)
 │       └── __init__.py
