@@ -8,3 +8,4 @@ sounddevice==0.4.7      # needed by openwakeword
 numpy==1.26.4
 spacy==3.7.5            # for future NLP
 # en_core_web_sm model is downloaded separately
+pynput>=1.7.7
