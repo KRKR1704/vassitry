@@ -4,8 +4,26 @@ PyAudio==0.2.14
 pyttsx3==2.90
 pvporcupine==3.0.2     # if using Porcupine (requires access key)
 openwakeword==0.6.0    # optional: open-source wake word engine
-sounddevice==0.4.7      # needed by openwakeword
+sounddevice==0.4.7     # needed by openwakeword
 numpy==1.26.4
 spacy==3.7.5            # for future NLP
 # en_core_web_sm model is downloaded separately
 pynput>=1.7.7
+
+# ---- Desktop controls (Windows-first) ----
+# Audio endpoints & master volume
+comtypes==1.2.0 ; platform_system=="Windows"
+pycaw==20230407 ; platform_system=="Windows"
+
+# Brightness control
+screen-brightness-control>=0.22.2 ; platform_system=="Windows"
+wmi>=1.5.1 ; platform_system=="Windows"           # used by screen_brightness_control
+pywin32>=305 ; platform_system=="Windows"         # required by several Windows libs
+
+# Battery / system info
+psutil>=5.9.5
+
+# Window ops and screenshots
+pygetwindow>=0.0.9 ; platform_system=="Windows"
+pyautogui>=0.9.54
+Pillow>=10.1.0

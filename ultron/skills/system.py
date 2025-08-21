@@ -10,8 +10,7 @@
 from __future__ import annotations
 
 import ctypes
-from ctypes import wintypes  # <-- added for Night Light signatures (safe to include)
-import os
+from ctypes import wintypes
 import platform
 import re
 import subprocess
@@ -23,26 +22,16 @@ IS_WINDOWS = platform.system() == "Windows"
 
 # -------------------------- Optional libraries (guarded) --------------------------
 
-# COM / pycaw for audio volume + endpoints
+# COM / pycaw for audio volume
 _PYCAW = False
-_PYCAW_UTILS = False
 try:
     if IS_WINDOWS:
         from ctypes import POINTER, cast  # type: ignore
-        from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize, GUID  # type: ignore
+        from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize  # type: ignore
         from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume  # type: ignore
-        try:
-            from pycaw.utils import AudioUtilities as AU  # type: ignore
-            _PYCAW_UTILS = True
-        except Exception:
-            _PYCAW_UTILS = False
         _PYCAW = True
 except Exception:
     _PYCAW = False
-    _PYCAW_UTILS = False
-
-def _get_AU():
-    return AU if _PYCAW_UTILS else AudioUtilities
 
 # Brightness
 _HAS_SBC = False
@@ -169,141 +158,16 @@ def display_mode(mode: str) -> bool:
     return rc == 0
 
 
-# -------------------------- Audio endpoints: list & switch default --------------------------
+# -------------------------- Audio endpoints: (listing disabled), switch default --------------------------
+# NOTE: Per your request, listing audio devices is disabled. The function remains as a harmless stub.
 
 def audio_list_outputs() -> List[Dict[str, str]]:
-    results: List[Dict[str, str]] = []
-    if not (_PYCAW and IS_WINDOWS):
-        return results
-    try:
-        CoInitialize()
-        try:
-            AUref = _get_AU()
-            try:
-                devices = AUref.GetAllDevices()
-            except Exception:
-                defaults = [
-                    AUref.GetDefaultAudioEndpoint("Render", "Console"),
-                    AUref.GetDefaultAudioEndpoint("Render", "Multimedia"),
-                    AUref.GetDefaultAudioEndpoint("Render", "Communications"),
-                ]
-                seen = set()
-                devices = []
-                for d in defaults:
-                    if d and getattr(d, "id", None) and d.id not in seen:
-                        seen.add(d.id)
-                        devices.append(d)
-            default_ids: Dict[str, Optional[str]] = {"console": None, "multimedia": None, "communications": None}
-            try:
-                default_ids["console"] = AUref.GetDefaultAudioEndpoint("Render", "Console").id
-                default_ids["multimedia"] = AUref.GetDefaultAudioEndpoint("Render", "Multimedia").id
-                default_ids["communications"] = AUref.GetDefaultAudioEndpoint("Render", "Communications").id
-            except Exception:
-                pass
+    """Disabled: return empty list so callers fail gracefully."""
+    return []
 
-            for d in devices:
-                try:
-                    df = (getattr(d, "data_flow", "") or getattr(d, "DataFlow", "") or "").lower()
-                    if df and df != "render": continue
-                    dev_id = getattr(d, "id", "") or ""
-                    name = getattr(d, "FriendlyName", None) or "Unknown"
-                    state_val = getattr(d, "State", None)
-                    state_map = {1: "active", 2: "disabled", 4: "not_present", 8: "unplugged"}
-                    state_str = state_map.get(state_val, "unknown")
-                    roles = [role for role, rid in default_ids.items() if rid and dev_id and rid == dev_id]
-                    results.append({"id": dev_id, "name": name, "state": state_str, "default": ",".join(roles) or "none"})
-                except Exception:
-                    continue
-        finally:
-            CoUninitialize()
-    except Exception:
-        return results
-    return results
-
-def _set_default_endpoint(device_id: str) -> bool:
-    if not (_PYCAW and IS_WINDOWS and device_id):
-        return False
-    try:
-        class IPolicyConfig(ctypes.Structure):
-            _fields_ = [("lpVtbl", ctypes.c_void_p * 20)]
-
-        IID_IPolicyConfig = GUID("{F8679F50-850A-41CF-9C72-430F290290C8}")
-        CLSID_PolicyConfigClient = GUID("{870AF99C-171D-4F9E-AF0D-E63DF40C2BC9}")
-
-        CoInitialize()
-        try:
-            ppv = ctypes.c_void_p()
-            hr = ctypes.windll.ole32.CoCreateInstance(
-                ctypes.byref(CLSID_PolicyConfigClient),
-                None,
-                1,  # CLSCTX_INPROC_SERVER
-                ctypes.byref(IID_IPolicyConfig),
-                ctypes.byref(ppv),
-            )
-            if hr != 0 or not ppv.value:
-                return False
-
-            iface = ctypes.c_void_p(ppv.value)
-
-            def _call(role: int) -> bool:
-                for idx in (13, 12, 14, 10):
-                    try:
-                        vtbl = ctypes.cast(iface, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
-                        func = ctypes.cast(
-                            vtbl[idx],
-                            ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int)
-                        )
-                        hr2 = func(iface, ctypes.c_wchar_p(device_id), ctypes.c_int(role))
-                        if hr2 == 0:
-                            return True
-                    except Exception:
-                        continue
-                return False
-
-            ok = True
-            for role in (0, 1, 2):  # Console, Multimedia, Communications
-                ok = _call(role) and ok
-            return ok
-        finally:
-            CoUninitialize()
-    except Exception:
-        return False
-
+# (Keep audio_switch_output if main.py still calls it; it will receive 'no_devices' from the stub.)
 def audio_switch_output(name_or_id: str) -> Tuple[bool, str]:
-    target = (name_or_id or "").strip()
-    if not target:
-        return False, "no_device"
-    devices = audio_list_outputs()
-    if not devices:
-        return False, "no_devices"
-    low = target.lower()
-
-    for d in devices:
-        if low == d["id"].lower():
-            ok = _set_default_endpoint(d["id"])
-            return (ok, d["name"] if ok else "set_failed")
-    for d in devices:
-        if low == d["name"].lower():
-            ok = _set_default_endpoint(d["id"])
-            return (ok, d["name"] if ok else "set_failed")
-    try:
-        from difflib import get_close_matches
-        names = [d["name"] for d in devices]
-        match = get_close_matches(target, names, n=1, cutoff=0.72)
-        if match:
-            chosen = match[0]
-            for d in devices:
-                if d["name"] == chosen:
-                    ok = _set_default_endpoint(d["id"])
-                    return (ok, d["name"] if ok else "set_failed")
-    except Exception:
-        pass
-    alias = low.replace("the ", "").replace("default ", "").strip()
-    for d in devices:
-        if alias in d["name"].lower():
-            ok = _set_default_endpoint(d["id"])
-            return (ok, d["name"] if ok else "set_failed")
-    return False, "device_not_found"
+    return False, "no_devices"
 
 
 # -------------------------- Audio master volume (set/up/down/mute) --------------------------
@@ -315,6 +179,7 @@ def _get_endpoint_volume():
         CoInitialize()
         speakers = AudioUtilities.GetSpeakers()
         interface = speakers.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        from ctypes import POINTER, cast  # local import to satisfy static checkers
         vol = cast(interface, POINTER(IAudioEndpointVolume))
         return vol
     except Exception:
@@ -423,12 +288,9 @@ def brightness_down(step: int = 10) -> bool:
 
 
 # -------------------------- Night light (software gamma, per-display) --------------------------
-# Applies a warm gamma ramp on every attached display. Restores originals on "off".
 
 _user32 = ctypes.windll.user32 if IS_WINDOWS else None
 _gdi32  = ctypes.windll.gdi32  if IS_WINDOWS else None
-
-from ctypes import wintypes
 
 # GDI signatures
 if IS_WINDOWS and _gdi32:
@@ -441,10 +303,18 @@ if IS_WINDOWS and _gdi32:
     _gdi32.DeleteDC.argtypes           = [wintypes.HDC]
     _gdi32.DeleteDC.restype            = wintypes.BOOL
 
-# user32 EnumDisplayDevicesW
+# user32 EnumDisplayDevicesW + (added) GetForegroundWindow/ShowWindow/PostMessageW for window controls
 if IS_WINDOWS and _user32:
     _user32.EnumDisplayDevicesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
     _user32.EnumDisplayDevicesW.restype  = wintypes.BOOL
+    # ---- window control signatures ----
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    _user32.ShowWindow.restype  = wintypes.BOOL
+    _user32.PostMessageW.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
+    _user32.PostMessageW.restype  = wintypes.BOOL
+    _user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    _user32.ReleaseDC.restype  = ctypes.c_int
 
 DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x00000001
 
@@ -471,7 +341,6 @@ _GAMMA_ACTIVE: bool = False
 _GAMMA_STRENGTH: int = 60  # default warmth percent
 
 def _enum_display_devices() -> list[str]:
-    """Return list of device names like '\\\\.\\DISPLAY1' that are attached to desktop."""
     names: list[str] = []
     if not (IS_WINDOWS and _user32):
         return names
@@ -489,7 +358,6 @@ def _enum_display_devices() -> list[str]:
     return names
 
 def _open_hdcs_for_all() -> list[tuple[wintypes.HDC, str]]:
-    """Open HDCs for each display device + a generic screen DC fallback."""
     hdcs: list[tuple[wintypes.HDC, str]] = []
     if not (IS_WINDOWS and _gdi32 and _user32):
         return hdcs
@@ -545,7 +413,6 @@ def _read_current_for(hdc: wintypes.HDC) -> GAMMARAMP | None:
     return buf if ok else None
 
 def _apply_for_all(ramp_for_key: dict[str, GAMMARAMP] | GAMMARAMP) -> bool:
-    """Apply ramp(s). If dict provided, use per-key; else use same ramp for all."""
     ok_any = False
     hdcs = _open_hdcs_for_all()
     try:
@@ -564,11 +431,9 @@ def _apply_for_all(ramp_for_key: dict[str, GAMMARAMP] | GAMMARAMP) -> bool:
     return ok_any
 
 def night_light_on(strength: int = 60) -> bool:
-    """Enable warm tint via gamma ramp on all displays. strength: 0–100 (default 60)."""
     if not (IS_WINDOWS and _gdi32 and _user32):
         return False
     global _GAMMA_ACTIVE, _GAMMA_STRENGTH, _GAMMA_ORIG_MAP
-    # Capture originals per display (once)
     if not _GAMMA_ORIG_MAP:
         hdcs = _open_hdcs_for_all()
         try:
@@ -590,20 +455,16 @@ def night_light_on(strength: int = 60) -> bool:
     return ok
 
 def night_light_off() -> bool:
-    """Restore the original gamma ramp per display (linear if unknown)."""
     if not (IS_WINDOWS and _gdi32 and _user32):
         return False
-    # Build a per-key ramp map; fall back to linear for keys without saved originals
     ramp_map: dict[str, GAMMARAMP] = {}
-    # Use current attached displays as keys we try to restore
     keys = _enum_display_devices()
     if not keys:
-        keys = ["screen"]  # fallback
+        keys = ["screen"]
     for k in keys:
         ramp_map[k] = _GAMMA_ORIG_MAP.get(k, _gamma_linear_ramp())
     ok = _apply_for_all(ramp_map)
     if ok:
-        # Keep originals cached for future toggles; just mark inactive
         global _GAMMA_ACTIVE
         _GAMMA_ACTIVE = False
     return ok
@@ -613,11 +474,8 @@ def night_light_toggle(strength: Optional[int] = None) -> bool:
         return night_light_off()
     return night_light_on(_GAMMA_STRENGTH if strength is None else strength)
 
-# Back-compat alias (existing code may call this)
 def toggle_night_light() -> bool:
     return night_light_toggle()
-
-
 
 
 # -------------------------- Power --------------------------
@@ -668,9 +526,26 @@ def battery_percent() -> Optional[int]:
         return None
 
 
-# -------------------------- Window controls --------------------------
+# -------------------------- Window controls (WinAPI + fallbacks) --------------------------
+
+SW_MINIMIZE = 6
+SW_MAXIMIZE = 3
+SW_RESTORE  = 9
+WM_SYSCOMMAND = 0x0112
+SC_CLOSE      = 0xF060
 
 def minimize_active_window() -> bool:
+    # WinAPI first
+    if IS_WINDOWS and _user32:
+        try:
+            hwnd = _user32.GetForegroundWindow()
+            if hwnd:
+                ok = bool(_user32.ShowWindow(hwnd, SW_MINIMIZE))
+                if ok:
+                    return True
+        except Exception:
+            pass
+    # Fallbacks
     if _HAS_PYW:
         try:
             win = gw.getActiveWindow()
@@ -681,6 +556,7 @@ def minimize_active_window() -> bool:
             pass
     if _HAS_PYAUTOGUI and IS_WINDOWS:
         try:
+            import pyautogui
             pyautogui.hotkey("win", "down"); pyautogui.hotkey("win", "down")
             return True
         except Exception:
@@ -688,6 +564,17 @@ def minimize_active_window() -> bool:
     return False
 
 def maximize_active_window() -> bool:
+    if IS_WINDOWS and _user32:
+        try:
+            hwnd = _user32.GetForegroundWindow()
+            if hwnd:
+                _user32.ShowWindow(hwnd, SW_RESTORE)  # ensure not minimized
+                ok = bool(_user32.ShowWindow(hwnd, SW_MAXIMIZE))
+                if ok:
+                    return True
+        except Exception:
+            pass
+    # Fallbacks
     if _HAS_PYW:
         try:
             win = gw.getActiveWindow()
@@ -698,6 +585,7 @@ def maximize_active_window() -> bool:
             pass
     if _HAS_PYAUTOGUI and IS_WINDOWS:
         try:
+            import pyautogui
             pyautogui.hotkey("win", "up")
             return True
         except Exception:
@@ -705,6 +593,15 @@ def maximize_active_window() -> bool:
     return False
 
 def close_active_window() -> bool:
+    if IS_WINDOWS and _user32:
+        try:
+            hwnd = _user32.GetForegroundWindow()
+            if hwnd:
+                if _user32.PostMessageW(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0):
+                    return True
+        except Exception:
+            pass
+    # Fallbacks
     if _HAS_PYW:
         try:
             win = gw.getActiveWindow()
@@ -715,6 +612,7 @@ def close_active_window() -> bool:
             pass
     if _HAS_PYAUTOGUI and IS_WINDOWS:
         try:
+            import pyautogui
             pyautogui.hotkey("alt", "f4")
             return True
         except Exception:
@@ -729,6 +627,7 @@ def screenshot(save_dir: Optional[str] = None) -> Optional[str]:
         return None
     try:
         if _HAS_PYAUTOGUI:
+            import pyautogui
             img = pyautogui.screenshot()
         else:
             return None
