@@ -14,13 +14,13 @@ load_dotenv()
 
 # Core config
 PORCUPINE_ACCESS_KEY = os.getenv("PORCUPINE_ACCESS_KEY", "")
-WAKE_ENGINE = os.getenv("WAKE_ENGINE", "openwakeword").lower()   # "hotkey" | "openwakeword" | "porcupine"
+WAKE_ENGINE = os.getenv("WAKE_ENGINE", "hotkey").lower()   # "hotkey" | "openwakeword" | "porcupine"
 WAKEWORD = os.getenv("WAKEWORD", "ultron").strip()
 BROWSER = os.getenv("BROWSER", "default").lower()
 
 # Global hotkey (used when WAKE_ENGINE == "hotkey")
 # Examples: "ctrl+alt+u", "win+shift+space", "ctrl+shift+enter"
-HOTKEY = os.getenv("ULTRON_HOTKEY", "ctrl+alt+u")
+HOTKEY = os.getenv("ULTRON_HOTKEY", "alt+u")
 
 # Microphone: None = system default
 MIC_INDEX = None
