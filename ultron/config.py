@@ -1,3 +1,4 @@
+# ultron/config.py
 import os
 from dotenv import load_dotenv
 
@@ -5,9 +6,13 @@ load_dotenv()
 
 # Core config
 PORCUPINE_ACCESS_KEY = os.getenv("PORCUPINE_ACCESS_KEY", "")
-WAKE_ENGINE = os.getenv("WAKE_ENGINE", "openwakeword").lower()
+WAKE_ENGINE = os.getenv("WAKE_ENGINE", "openwakeword").lower()   # "hotkey" | "openwakeword" | "porcupine"
 WAKEWORD = os.getenv("WAKEWORD", "ultron").strip()
 BROWSER = os.getenv("BROWSER", "default").lower()
+
+# Global hotkey (used when WAKE_ENGINE == "hotkey")
+# Examples: "ctrl+alt+u", "win+shift+space", "ctrl+shift+enter"
+HOTKEY = os.getenv("ULTRON_HOTKEY", "ctrl+alt+u")
 
 # Microphone: None = system default
 MIC_INDEX = None
@@ -31,7 +36,7 @@ TTS_RATE = int(os.getenv("TTS_RATE", "0"))                  # pyttsx3: relative 
 TTS_VOLUME = float(os.getenv("TTS_VOLUME", "1.0"))
 TTS_STARTUP_TEST = os.getenv("TTS_STARTUP_TEST", "0").strip() in ("1", "true", "yes")
 
-# Wait after wake-ack voice (optional; already added earlier)
+# Wait after wake-ack voice
 ACK_BLOCKING_SECS = float(os.getenv("ACK_BLOCKING_SECS", "1.2"))
 
 # Logging
