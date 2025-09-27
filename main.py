@@ -13,8 +13,23 @@ from ultron.listener import Listener
 from ultron.tts import TTS
 from ultron.nlp.intent import parse_intent
 from ultron.skills.browser import open_url
-from ultron.skills.apps import open_browser_app
-from ultron.skills import system as sysctl   # Desktop/system controls
+
+# --- Apps & system controls: keep both branches, but import defensively ---
+try:
+    from ultron.skills.apps import open_app  # desktop app launcher (HEAD)
+except Exception:  # pragma: no cover
+    open_app = None
+
+try:
+    from ultron.skills.apps import open_browser_app  # browser app launcher (RR)
+except Exception:  # pragma: no cover
+    open_browser_app = None
+
+try:
+    from ultron.skills import system as sysctl   # Desktop/system controls (RR)
+except Exception:  # pragma: no cover
+    sysctl = None
+
 from ultron.ack import wake_ack
 from ultron.hotkey import HotkeyEngine
 
@@ -27,15 +42,14 @@ listener = Listener(
     dynamic_energy=True,
     calibrate_on_start=True,
     calibration_duration=0.25,
-    pause_threshold=0.8,          # waits a bit longer before deciding you stopped
-    non_speaking_duration=0.30,   # tolerate tiny gaps
-    phrase_time_limit=15          # more time to speak
+    pause_threshold=0.8,
+    non_speaking_duration=0.30,
+    phrase_time_limit=15
 )
 
 def log_event(event: dict):
     event["ts"] = datetime.utcnow().isoformat() + "Z"
-    os.makedirs(os.path.dirname(LOGS_PATH), exist_ok=True
-    )
+    os.makedirs(os.path.dirname(LOGS_PATH), exist_ok=True)
     with open(LOGS_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
@@ -55,11 +69,12 @@ def _ensure_url(site: str) -> str:
     s = (site or "").strip().lower()
     if not s:
         return s
-    if s.startswith(("http://", "https://")):
-        return s
-    if "." not in s:
-        s += ".com"
-    return "https://" + s
+    s = s.replace(" ", "")
+    if not s.startswith(("http://", "https://")):
+        if "." not in s:
+            s += ".com"
+        s = "https://" + s
+    return s
 
 def _speak_ok_fail(ok: bool, ok_msg: str, fail_msg: str):
     tts.speak(ok_msg if ok else fail_msg)
@@ -173,7 +188,6 @@ def _hotkey_confirm_pressed(reqs: list[list[int]], samples: int = 3, interval_ms
     for _ in range(max(1, samples)):
         all_ok = True
         for group in reqs:
-            # group is satisfied if ANY vk in the group is down
             if not any(_vk_down(vk) for vk in group):
                 all_ok = False
                 break
@@ -203,18 +217,34 @@ def handle_command(text: str):
         tts.speak_blocking(say, timeout=2.5)
         ok = open_url(url, browser_pref=BROWSER)
         log_action("open_site", "success" if ok else "failed", target=url)
+        return
 
-    # --- OPEN DESKTOP APP / BROWSER APP ---
     if intent.intent == "open_app" and isinstance(intent.entity, str):
-        app = intent.entity
-        to_say = f"Opening {app} browser"
-        print(f"[Ultron] {to_say}")
-        tts.speak_blocking(to_say, timeout=2.5)
-        ok = open_browser_app(app)
+        app = intent.entity.strip()
+        said = f"Opening {app}"
+        print(f"[Ultron] {said}")
+        tts.speak_blocking(said, timeout=2.5)
+
+        ok = False
+        # Prefer browser app if available; fall back to desktop app.
+        if open_browser_app is not None:
+            try:
+                ok = open_browser_app(app)
+            except Exception:
+                ok = False
+        if not ok and open_app is not None:
+            try:
+                ok = open_app(app)
+            except Exception:
+                ok = False
+
         log_action("open_app", "success" if ok else "failed", target=app)
+        if not ok:
+            tts.speak(f"I couldn't find or launch {app} on this PC.")
+        return
 
     # ---------- Audio ----------
-    elif intent.intent == "volume_set" and intent.entity:
+    if intent.intent == "volume_set" and intent.entity and sysctl:
         try:
             pct = int(intent.entity)
         except Exception:
@@ -225,32 +255,37 @@ def handle_command(text: str):
         finally:
             _speak_ok_fail(ok, f"Volume set to {pct} percent.", "Sorry, I couldn't change the volume.")
             log_action("volume_set", "success" if ok else "failed", target=pct)
+        return
 
-    elif intent.intent == "volume_up":
+    if intent.intent == "volume_up" and sysctl:
         step = int(intent.entity) if intent.entity else 5
         ok = sysctl.volume_up(step)
         _speak_ok_fail(ok, "Volume up.", "Volume up failed.")
         log_action("volume_up", "success" if ok else "failed", target=step)
+        return
 
-    elif intent.intent == "volume_down":
+    if intent.intent == "volume_down" and sysctl:
         step = int(intent.entity) if intent.entity else 5
         ok = sysctl.volume_down(step)
         _speak_ok_fail(ok, "Volume down.", "Volume down failed.")
         log_action("volume_down", "success" if ok else "failed", target=step)
+        return
 
-    elif intent.intent == "volume_mute":
+    if intent.intent == "volume_mute" and sysctl:
         ok = sysctl.mute()
         _speak_ok_fail(ok, "Muted.", "Mute failed.")
         log_action("mute", "success" if ok else "failed")
+        return
 
-    elif intent.intent == "volume_unmute":
+    if intent.intent == "volume_unmute" and sysctl:
         ok = sysctl.unmute()
         _speak_ok_fail(ok, "Unmuted.", "Unmute failed.")
         log_action("unmute", "success" if ok else "failed")
+        return
 
     # ---------- Audio devices ----------
-    elif intent.intent == "audio_list_outputs":
-        if hasattr(sysctl, "audio_list_outputs"):
+    if intent.intent == "audio_list_outputs":
+        if sysctl and hasattr(sysctl, "audio_list_outputs"):
             try:
                 outs = sysctl.audio_list_outputs() or []
             except Exception as e:
@@ -272,9 +307,9 @@ def handle_command(text: str):
         else:
             tts.speak("Listing audio outputs isn't available on this build.")
             log_action("audio_list_outputs", "not_supported")
+        return
 
-    elif intent.intent == "audio_switch_output":
-        # Use the parsed entity if it's specific; otherwise salvage from the raw utterance.
+    if intent.intent == "audio_switch_output":
         requested = (intent.entity or "").strip()
         generic = requested.lower() in _GENERIC_AUDIO_WORDS or not requested
         if generic:
@@ -287,24 +322,22 @@ def handle_command(text: str):
             log_action("audio_switch_output", "failed", requested=intent.entity, reason="no_device_name_extracted")
             return
 
-        # 1) Try switching among current audio endpoints
-        if hasattr(sysctl, "audio_switch_output"):
+        ok, info = False, "not_supported"
+        if sysctl and hasattr(sysctl, "audio_switch_output"):
             try:
                 ok, info = sysctl.audio_switch_output(requested)
             except Exception as e:
                 print(f"[Ultron][ERR] audio_switch_output: {e}")
                 ok, info = False, "error"
-        else:
-            ok, info = False, "not_supported"
 
         if ok:
             tts.speak(f"Audio output set to {info}.")
             log_action("audio_switch_output", "success", requested=requested, chosen=info)
             return
 
-        # 2) Fallback: check paired Bluetooth devices and open settings if we find a match
+        # Fallback: check paired Bluetooth devices and open settings if we find a match
         bt_list = []
-        if hasattr(sysctl, "bluetooth_list_paired"):
+        if sysctl and hasattr(sysctl, "bluetooth_list_paired"):
             try:
                 bt_list = sysctl.bluetooth_list_paired() or []
             except Exception as e:
@@ -315,16 +348,13 @@ def handle_command(text: str):
                 from difflib import get_close_matches
                 names = [d["name"] for d in bt_list]
                 match = get_close_matches(requested, names, n=1, cutoff=0.6)
-                if match:
-                    best = match[0]
-                else:
-                    best = next((n for n in names if requested.lower() in n.lower()), None)
+                best = match[0] if match else next((n for n in names if requested.lower() in n.lower()), None)
             except Exception:
                 best = None
 
             if best:
                 tts.speak(f"I found a paired device named {best}. Please connect it from Bluetooth settings; I’ll open it now.")
-                if hasattr(sysctl, "open_bluetooth_settings"):
+                if sysctl and hasattr(sysctl, "open_bluetooth_settings"):
                     try:
                         sysctl.open_bluetooth_settings()
                     except Exception as e:
@@ -332,7 +362,6 @@ def handle_command(text: str):
                 log_action("audio_switch_output", "paired_not_connected", requested=requested, paired_match=best, reason=info)
                 return
 
-        # 3) Final guidance if nothing matched
         if info in ("device_not_found", "no_devices"):
             tts.speak("I couldn't find that audio device. Make sure it’s connected, then say ‘list audio outputs’ and try again.")
         elif info == "not_supported":
@@ -340,9 +369,10 @@ def handle_command(text: str):
         else:
             tts.speak("I couldn't switch the audio output.")
         log_action("audio_switch_output", "failed", requested=requested, reason=info)
+        return
 
-    # ---------- Display (brightness already below) ----------
-    elif intent.intent == "brightness_set" and intent.entity:
+    # ---------- Display (brightness) ----------
+    if intent.intent == "brightness_set" and sysctl and intent.entity:
         try:
             pct = int(intent.entity)
         except Exception:
@@ -350,59 +380,62 @@ def handle_command(text: str):
         ok = sysctl.set_brightness(pct)
         _speak_ok_fail(ok, f"Brightness set to {pct} percent.", "Brightness control isn't available.")
         log_action("brightness_set", "success" if ok else "failed", target=pct)
+        return
 
-    elif intent.intent == "brightness_up":
+    if intent.intent == "brightness_up" and sysctl:
         step = int(intent.entity) if intent.entity else 10
         ok = sysctl.brightness_up(step)
         _speak_ok_fail(ok, "Brightness up.", "Brightness up failed.")
         log_action("brightness_up", "success" if ok else "failed", target=step)
+        return
 
-    elif intent.intent == "brightness_down":
+    if intent.intent == "brightness_down" and sysctl:
         step = int(intent.entity) if intent.entity else 10
         ok = sysctl.brightness_down(step)
         _speak_ok_fail(ok, "Brightness down.", "Brightness down failed.")
         log_action("brightness_down", "success" if ok else "failed", target=step)
+        return
 
     # ---------- Night Light ----------
-    elif intent.intent == "night_light_toggle":
+    if intent.intent == "night_light_toggle" and sysctl:
         ok = sysctl.night_light_toggle()
         _speak_ok_fail(ok, "Night light toggled.", "I couldn't toggle Night light.")
         log_action("night_light_toggle", "success" if ok else "failed")
+        return
 
-    elif intent.intent == "night_light_on":
-        ok = sysctl.night_light_on()  # default strength 60%
+    if intent.intent == "night_light_on" and sysctl:
+        ok = sysctl.night_light_on()
         _speak_ok_fail(ok, "Night light on.", "I couldn't turn Night light on.")
         log_action("night_light_on", "success" if ok else "failed")
+        return
 
-    elif intent.intent == "night_light_off":
+    if intent.intent == "night_light_off" and sysctl:
         ok = sysctl.night_light_off()
         _speak_ok_fail(ok, "Night light off.", "I couldn't turn Night light off.")
         log_action("night_light_off", "success" if ok else "failed")
+        return
 
     # ---------- Display mode / Projection ----------
-    elif intent.intent == "display_mode" and intent.entity:
+    if intent.intent == "display_mode" and sysctl and intent.entity:
         mode = intent.entity  # 'extend' | 'clone' | 'internal' | 'external'
-        if hasattr(sysctl, "display_mode"):
-            try:
-                ok = sysctl.display_mode(mode)
-            except Exception as e:
-                print(f"[Ultron][ERR] display_mode: {e}")
-                ok = False
-            spoken = {
-                "extend": "Extended display.",
-                "clone": "Duplicated display.",
-                "internal": "PC screen only.",
-                "external": "Second screen only."
-            }.get(mode, "Display mode changed.")
-            _speak_ok_fail(ok, spoken, "I couldn't change the display mode.")
-            log_action("display_mode", "success" if ok else "failed", mode=mode)
-        else:
-            tts.speak("Changing display mode isn't available on this build.")
-            log_action("display_mode", "not_supported", mode=mode)
+        try:
+            ok = sysctl.display_mode(mode)
+        except Exception as e:
+            print(f"[Ultron][ERR] display_mode: {e}")
+            ok = False
+        spoken = {
+            "extend": "Extended display.",
+            "clone": "Duplicated display.",
+            "internal": "PC screen only.",
+            "external": "Second screen only."
+        }.get(mode, "Display mode changed.")
+        _speak_ok_fail(ok, spoken, "I couldn't change the display mode.")
+        log_action("display_mode", "success" if ok else "failed", mode=mode)
+        return
 
     # ---------- Connectivity (Wi-Fi) ----------
-    elif intent.intent == "wifi_status":
-        if hasattr(sysctl, "wifi_status"):
+    if intent.intent == "wifi_status":
+        if sysctl and hasattr(sysctl, "wifi_status"):
             try:
                 st = sysctl.wifi_status() or {}
             except Exception as e:
@@ -429,9 +462,10 @@ def handle_command(text: str):
         else:
             tts.speak("Wi-Fi status isn't available on this build.")
             log_action("wifi_status", "not_supported")
+        return
 
-    elif intent.intent == "wifi_on":
-        if hasattr(sysctl, "wifi_on"):
+    if intent.intent == "wifi_on":
+        if sysctl and hasattr(sysctl, "wifi_on"):
             try:
                 ok = sysctl.wifi_on()
             except Exception as e:
@@ -442,9 +476,10 @@ def handle_command(text: str):
         else:
             tts.speak("Turning Wi-Fi on isn't available on this build.")
             log_action("wifi_on", "not_supported")
+        return
 
-    elif intent.intent == "wifi_off":
-        if hasattr(sysctl, "wifi_off"):
+    if intent.intent == "wifi_off":
+        if sysctl and hasattr(sysctl, "wifi_off"):
             try:
                 ok = sysctl.wifi_off()
             except Exception as e:
@@ -455,9 +490,10 @@ def handle_command(text: str):
         else:
             tts.speak("Turning Wi-Fi off isn't available on this build.")
             log_action("wifi_off", "not_supported")
+        return
 
-    elif intent.intent == "wifi_disconnect":
-        if hasattr(sysctl, "wifi_disconnect"):
+    if intent.intent == "wifi_disconnect":
+        if sysctl and hasattr(sysctl, "wifi_disconnect"):
             ok = False
             try:
                 ok = sysctl.wifi_disconnect()
@@ -468,10 +504,11 @@ def handle_command(text: str):
         else:
             tts.speak("Disconnecting from Wi-Fi isn't available on this build.")
             log_action("wifi_disconnect", "not_supported")
+        return
 
-    elif intent.intent == "wifi_connect" and intent.entity:
+    if intent.intent == "wifi_connect" and intent.entity:
         ssid = intent.entity.strip().strip('"')
-        if hasattr(sysctl, "wifi_connect"):
+        if sysctl and hasattr(sysctl, "wifi_connect"):
             try:
                 ok = sysctl.wifi_connect(ssid)
             except Exception as e:
@@ -482,41 +519,46 @@ def handle_command(text: str):
         else:
             tts.speak("Connecting to Wi-Fi networks isn't available on this build.")
             log_action("wifi_connect", "not_supported", ssid=ssid)
+        return
 
     # ---------- Power ----------
-    elif intent.intent == "power_sleep":
+    if intent.intent == "power_sleep" and sysctl:
         tts.speak("Going to sleep.")
         log_action("sleep", "issued")
         try:
             sysctl.sleep()
         except Exception as e:
             print(f"[Ultron][ERR] sleep: {e}")
+        return
 
-    elif intent.intent == "power_shutdown":
+    if intent.intent == "power_shutdown" and sysctl:
         tts.speak("Shutting down.")
         log_action("shutdown", "issued")
         try:
             sysctl.shutdown()
         except Exception as e:
             print(f"[Ultron][ERR] shutdown: {e}")
+        return
 
-    elif intent.intent == "power_restart":
+    if intent.intent == "power_restart" and sysctl:
         tts.speak("Restarting.")
         log_action("restart", "issued")
         try:
             sysctl.restart()
         except Exception as e:
             print(f"[Ultron][ERR] restart: {e}")
+        return
 
-    elif intent.intent == "power_lock":
+    if intent.intent == "power_lock" and sysctl:
         tts.speak("Locked.")
         log_action("lock", "issued")
         try:
             sysctl.lock()
         except Exception as e:
             print(f"[Ultron][ERR] lock: {e}")
+        return
 
-    elif intent.intent == "battery_query":
+    if intent.intent == "battery_query" and sysctl:
         pct = None
         try:
             pct = sysctl.battery_percent()
@@ -528,25 +570,29 @@ def handle_command(text: str):
         else:
             tts.speak(f"Battery at {pct} percent.")
             log_action("battery_query", "success", target=pct)
+        return
 
     # ---------- Window / App basics ----------
-    elif intent.intent == "window_minimize":
+    if intent.intent == "window_minimize" and sysctl:
         ok = sysctl.minimize_active_window()
         _speak_ok_fail(ok, "Minimized.", "I couldn't minimize that.")
         log_action("window_minimize", "success" if ok else "failed")
+        return
 
-    elif intent.intent == "window_maximize":
+    if intent.intent == "window_maximize" and sysctl:
         ok = sysctl.maximize_active_window()
         _speak_ok_fail(ok, "Maximized.", "I couldn't maximize that.")
         log_action("window_maximize", "success" if ok else "failed")
+        return
 
-    elif intent.intent == "window_close":
+    if intent.intent == "window_close" and sysctl:
         ok = sysctl.close_active_window()
         _speak_ok_fail(ok, "Closed.", "I couldn't close that.")
         log_action("window_close", "success" if ok else "failed")
+        return
 
     # ---------- Utility ----------
-    elif intent.intent == "screenshot":
+    if intent.intent == "screenshot" and sysctl:
         path = None
         try:
             path = sysctl.screenshot(None)
@@ -559,11 +605,12 @@ def handle_command(text: str):
                 pass
         tts.speak("Screenshot saved in your Screenshots folder." if path else "I couldn't take a screenshot.")
         log_action("screenshot", "success" if path else "failed", target=path)
+        return
 
     # ---------- Fallback ----------
-    else:
-        tts.speak("Try: ‘wifi status’, ‘extend my display’, ‘list audio outputs’, or ‘set volume to 50 percent’.")
-        log_action("unknown", "no_intent")
+    tts.speak("Try: ‘wifi status’, ‘extend my display’, ‘list audio outputs’, or ‘set volume to 50 percent’.")
+    log_action("unknown", "no_intent")
+
 
 # -------- trigger paths --------
 
@@ -574,7 +621,6 @@ def on_wake():
 
     print("[Ultron] Capturing command...")
     try:
-        # More time to START (timeout) and more time to SPEAK (phrase_time_limit)
         cmd = listener.listen_once(timeout=10, phrase_time_limit=15)
     except Exception as e:
         print(f"[Ultron] Listener error: {e}")

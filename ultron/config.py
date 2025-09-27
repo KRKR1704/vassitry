@@ -1,6 +1,14 @@
 # ultron/config.py
 import os
-from dotenv import load_dotenv
+
+# `python-dotenv` is optional for users who run the project without
+# an environment file. Import it if available, otherwise provide a
+# no-op `load_dotenv` so the rest of the config can import successfully.
+try:
+	from dotenv import load_dotenv  # type: ignore
+except ModuleNotFoundError:
+	def load_dotenv(*args, **kwargs):  # pragma: no cover - runtime fallback
+		return None
 
 load_dotenv()
 
