@@ -1,23 +1,45 @@
 # ultron/skills/gemini.py
 import os
 from typing import List
-from google import genai
-from google.genai import types
 
-_API_KEY = os.getenv("GOOGLE_API_KEY")
-if not _API_KEY:
-    raise RuntimeError("GOOGLE_API_KEY is missing in your environment (.env).")
+# ---- Dependencies ----
+# pip install google-genai
+try:
+    from google import genai
+    from google.genai import types
+except Exception as e:
+    raise ImportError(
+        "google-genai package not installed or import failed.\n"
+        "Install it with: pip install google-genai\n"
+        f"Details: {e}"
+    )
 
-client = genai.Client(api_key=_API_KEY)
+# Fast model that supports Google Search grounding (SDK v2)
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# Fast + supports search grounding
-MODEL_NAME = "gemini-2.5-flash"
-
-# Google Search grounding tool
+# Optional: Google Search grounding tool (safe to keep enabled)
 GSEARCH_TOOL = types.Tool(google_search=types.GoogleSearch())
 
+
+def _get_client() -> "genai.Client":
+    """
+    Lazy-initialize the Gemini client so .env can be loaded BEFORE this is called.
+    Looks for GOOGLE_API_KEY first, then GEMINI_API_KEY.
+    """
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "Missing GOOGLE_API_KEY (or GEMINI_API_KEY). "
+            "Ensure your .env is loaded before calling ask_gemini()."
+        )
+    return genai.Client(api_key=api_key)
+
+
 def _extract_sources(resp) -> List[str]:
-    """Best-effort: pull a few source URLs from grounding metadata (varies by SDK version)."""
+    """
+    Best-effort: pull a few source URLs from grounding metadata.
+    Structure can vary by SDK release, so be defensive.
+    """
     out, seen = [], set()
     try:
         cands = getattr(resp, "candidates", None) or []
@@ -37,7 +59,7 @@ def _extract_sources(resp) -> List[str]:
                     seen.add(url)
                     out.append(url)
 
-        # Fallback older field name
+        # Older fallback field
         if not out:
             refs = getattr(gm, "supporting_references", []) or []
             for r in refs:
@@ -47,28 +69,42 @@ def _extract_sources(resp) -> List[str]:
                     out.append(url)
     except Exception:
         pass
-
     return out[:3]
+
 
 def ask_gemini(query: str, include_sources: bool = False) -> str:
     """
-    Ask Gemini with Google Search grounding enabled.
+    Ask Gemini with optional Google Search grounding.
     Returns plain text; optionally appends a short 'Sources:' section.
     """
     try:
+        client = _get_client()
         config = types.GenerateContentConfig(
-            tools=[GSEARCH_TOOL],   # safety settings omitted (optional)
+            tools=[GSEARCH_TOOL],  # comment out if you don't want grounding
         )
-
         resp = client.models.generate_content(
             model=MODEL_NAME,
             contents=query,
             config=config,
         )
 
+        # Preferred convenience field
         text = (getattr(resp, "text", "") or "").strip()
+
+        # Fallback parse if needed
         if not text:
-            return "I couldn't find a reliable answer."
+            try:
+                parts = getattr(resp, "candidates", [])[0].content.parts
+                text = " ".join(
+                    getattr(p, "text", "")
+                    for p in parts
+                    if getattr(p, "text", "")
+                ).strip()
+            except Exception:
+                text = ""
+
+        if not text:
+            text = "I couldn't find a reliable answer."
 
         if include_sources:
             srcs = _extract_sources(resp)
