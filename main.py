@@ -1,3 +1,10 @@
+# --- load .env *before anything else* so keys are available to all modules ---
+try:
+    from dotenv import load_dotenv  # pip install python-dotenv
+    load_dotenv()
+except Exception as _e:
+    print(f"[Ultron][.env] Skipped loading .env: {_e}")
+
 import json
 import time
 import os
@@ -5,7 +12,9 @@ import re
 import platform
 import ctypes
 import threading
-from datetime import datetime
+from datetime import datetime, UTC
+
+from pynput import keyboard  # <-- NEW: for Esc-to-cancel
 
 from ultron.config import LOGS_PATH, BROWSER, WAKE_ENGINE, HOTKEY
 from ultron.wakeword import WakeWordEngine
@@ -13,37 +22,78 @@ from ultron.listener import Listener
 from ultron.tts import TTS
 from ultron.nlp.intent import parse_intent
 from ultron.skills.browser import open_url
-from ultron.skills.apps import open_app
-from ultron.skills.gemini import ask_gemini
-from ultron.ack import wake_ack
 
+# --- Optional skills (import defensively) ---
+try:
+    from ultron.skills.apps import open_app           # desktop app launcher
+except Exception:
+    open_app = None
+
+try:
+    from ultron.skills.apps import open_browser_app   # browser app launcher
+except Exception:
+    open_browser_app = None
+
+try:
+    from ultron.skills import system as sysctl        # system controls (volume, wifi, etc.)
+except Exception:
+    sysctl = None
+
+# Gemini fallback (log status so you know if it's active)
+try:
+    from ultron.skills.gemini import ask_gemini
+    print("[Ultron][Gemini] ask_gemini() loaded. Key present:",
+          bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")))
+except Exception as e:
+    ask_gemini = None
+    print(f"[Ultron][Gemini] disabled: {e}")
+
+from ultron.ack import wake_ack
+from ultron.hotkey import HotkeyEngine
+
+IS_WINDOWS = platform.system() == "Windows"
+_user32 = ctypes.windll.user32 if IS_WINDOWS else None
 
 tts = TTS()
+
+# ==== NEW: global cancel flag + helper ========================================
+SPEECH_CANCEL = threading.Event()
+
+def stop_speaking():
+    """Signal any ongoing TTS to stop ASAP."""
+    SPEECH_CANCEL.set()
+    try:
+        # If your TTS class exposes a stop() / cancel() method, call it.
+        if hasattr(tts, "stop"):
+            tts.stop()
+    except Exception:
+        pass
+# ==============================================================================
+
 listener = Listener(
     energy_threshold=300,
     dynamic_energy=True,
     calibrate_on_start=True,
     calibration_duration=0.25,  # fast boot calibration
-    pause_threshold=0.8,         # wait a bit longer before deciding you stopped
-    non_speaking_duration=0.30,  # tolerate tiny gaps
-    phrase_time_limit=15         # more time to speak
+    pause_threshold=0.8,        # wait a bit longer before deciding you stopped
+    non_speaking_duration=0.30, # tolerate tiny gaps
+    phrase_time_limit=15        # more time to speak
 )
 
-
 def log_event(event: dict):
-    event["ts"] = datetime.utcnow().isoformat() + "Z"
+    event["ts"] = datetime.now(UTC).isoformat()
     os.makedirs(os.path.dirname(LOGS_PATH), exist_ok=True)
     with open(LOGS_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
+def log_action(name: str, status: str, **fields):
+    payload = {"type": "action", "name": name, "status": status}
+    payload.update(fields)
+    log_event(payload)
 
 def _ensure_url(site: str) -> str:
     """
-    Build a valid URL from a spoken site name:
-    - trims and lowercases
-    - removes spaces (e.g., "hugging face" -> "huggingface")
-    - adds .com if no dot is present
-    - prefixes https:// if no scheme
+    Build a valid URL from a spoken site name.
     """
     s = (site or "").strip().lower()
     if not s:
@@ -55,29 +105,137 @@ def _ensure_url(site: str) -> str:
         s = "https://" + s
     return s
 
-
 def _speak_chunks(text: str, chunk_size: int = 350):
     """
     Safely speak long text by chunking to avoid TTS buffer issues.
-    Splits on sentence boundaries where possible.
+    Escape hatch: press ESC to cancel speaking.
     """
     if not text:
         return
+
+    if SPEECH_CANCEL.is_set():
+        return
+
     text = text.strip()
     if len(text) <= chunk_size:
-        tts.speak(text)
+        # single shot
+        try:
+            tts.speak(text)
+        except Exception:
+            pass
         return
 
     buf = []
     for token in text.replace("\n", " ").split(" "):
+        if SPEECH_CANCEL.is_set():
+            break
+        # flush chunk if it would overflow
         if sum(len(x) for x in buf) + len(buf) + len(token) > chunk_size:
-            tts.speak(" ".join(buf))
+            try:
+                tts.speak(" ".join(buf))
+            except Exception:
+                pass
             buf = [token]
         else:
             buf.append(token)
-    if buf:
-        tts.speak(" ".join(buf))
 
+    if not SPEECH_CANCEL.is_set() and buf:
+        try:
+            tts.speak(" ".join(buf))
+        except Exception:
+            pass
+
+# -------- Audio device-name extraction helpers --------
+_GENERIC_AUDIO_WORDS = {
+    "audio","sound","output","device","the","my","default",
+    "headphones","headset","headphone","speaker","speakers"
+}
+
+def _extract_device_name_from_text(utterance: str) -> str | None:
+    """
+    Pull a device-ish name from the user's phrase.
+    """
+    s = (utterance or "").strip()
+    if not s:
+        return None
+
+    m = re.search(r"[\"“']\s*([^\"”']+?)\s*[\"”']", s)
+    if m:
+        name = m.group(1).strip()
+        return name if len(name) >= 2 else None
+
+    low = s.lower()
+    m = re.search(
+        r"(?:switch|set|change|route|move)\s+(?:the\s+)?(?:audio|sound)?\s*(?:output|device)?\s*(?:to|onto|over to)\s+(.+)$",
+        low
+    )
+    tail = m.group(1).strip() if m else low
+
+    tokens = [t for t in re.split(r"[\s,]+", tail) if t and t not in _GENERIC_AUDIO_WORDS]
+    while tokens and tokens[-1] in {"please","now","thanks"}:
+        tokens.pop()
+    name = " ".join(tokens).strip()
+    return name if len(name) >= 3 else None
+
+# ===================== Strict Hotkey Guard =====================
+VK = {
+    "shift": [0xA0, 0xA1], "ctrl": [0xA2, 0xA3], "alt": [0xA4, 0xA5],
+    "win": [0x5B, 0x5C], "cmd": [0x5B, 0x5C], "meta": [0x5B, 0x5C], "super": [0x5B, 0x5C],
+    "space": [0x20], "tab": [0x09], "enter": [0x0D], "esc": [0x1B], "escape": [0x1B],
+    "backspace": [0x08], "delete": [0x2E],
+}
+
+def _vk_for_char(ch: str) -> int | None:
+    if len(ch) != 1:
+        return None
+    c = ch.upper()
+    if "A" <= c <= "Z" or "0" <= c <= "9":
+        return ord(c)
+    return None
+
+def _vk_for_token(tok: str) -> list[int]:
+    t = tok.strip().lower()
+    if t in VK:
+        return VK[t][:]
+    if t.startswith("f") and t[1:].isdigit():
+        n = int(t[1:])
+        if 1 <= n <= 24:
+            return [0x70 + (n - 1)]
+    v = _vk_for_char(t)
+    return [v] if v is not None else []
+
+def _parse_hotkey_to_requirements(combo: str) -> list[list[int]]:
+    parts = [p for p in re.split(r"[+\-]", combo or "") if p.strip()]
+    reqs: list[list[int]] = []
+    for p in parts:
+        vks = _vk_for_token(p)
+        if vks:
+            reqs.append(vks)
+    return reqs
+
+def _vk_down(vk: int) -> bool:
+    if not (IS_WINDOWS and _user32):
+        return True
+    state = _user32.GetAsyncKeyState(ctypes.c_int(vk))
+    return bool(state & 0x8000)
+
+def _hotkey_confirm_pressed(reqs: list[list[int]], samples: int = 3, interval_ms: int = 50) -> bool:
+    if not reqs:
+        return True
+    for _ in range(max(1, samples)):
+        if not all(any(_vk_down(vk) for vk in group) for group in reqs):
+            return False
+        time.sleep(interval_ms / 1000.0)
+    return True
+
+_HOTKEY_REQS = _parse_hotkey_to_requirements(HOTKEY)
+_LAST_HOTKEY_TS = 0.0
+_HOTKEY_LOCK = threading.Lock()
+_HOTKEY_COOLDOWN_SEC = 1.25
+# ===================== End Hotkey Guard =====================
+
+def _speak_ok_fail(ok: bool, ok_msg: str, fail_msg: str):
+    tts.speak(ok_msg if ok else fail_msg)
 
 def handle_command(text: str):
     intent = parse_intent(text)
@@ -101,7 +259,6 @@ def handle_command(text: str):
         tts.speak_blocking(said, timeout=2.5)
 
         ok = False
-        # Prefer browser app if available; fall back to desktop app.
         if open_browser_app is not None:
             try:
                 ok = open_browser_app(app)
@@ -482,32 +639,38 @@ def handle_command(text: str):
         log_action("screenshot", "success" if path else "failed", target=path)
         return
 
-    # --- FALLBACK: GENERAL QUESTION → GEMINI ---
-    print(f"[Ultron] Asking Gemini: {text}")
-    tts.speak("Let me check that for you.")
-    answer = ask_gemini(text)
+    # ---------- Fallback: General question → Gemini ----------
+    if ask_gemini is not None:
+        print(f"[Ultron] Asking Gemini: {text}")
+        tts.speak("Let me check that for you.")
+        answer = ask_gemini(text)
+        print(f"[Ultron] Gemini says: {answer}")
+        log_event({"type": "action", "name": "ask_gemini", "query": text, "answer": answer})
+        if isinstance(answer, str) and answer.startswith("Error contacting Gemini:"):
+            tts.speak("I couldn't reach Gemini right now.")
+            return
 
-    # Log and speak the result (chunked for stability)
-    print(f"[Ultron] Gemini says: {answer}")
-    log_event({"type": "action", "name": "ask_gemini", "query": text, "answer": answer})
-
-    if answer.startswith("Error contacting Gemini:"):
-        tts.speak("I couldn't reach Gemini right now.")
+        # NEW: clear cancel flag before long read
+        SPEECH_CANCEL.clear()
+        _speak_chunks(answer if isinstance(answer, str) else str(answer))
         return
 
-    _speak_chunks(answer)
+    # ---------- Final fallback ----------
+    tts.speak("Try: ‘wifi status’, ‘extend my display’, ‘list audio outputs’, or ‘set volume to 50 percent’.")
+    log_action("unknown", "no_intent")
 
-
+# -------- trigger paths --------
 def on_wake():
-    print("[Ultron] Wake word detected. Listening...")
-
-    # Non-blocking wake acknowledgment so the mic opens immediately
+    print("[Ultron] Listening (triggered)…")
+    # Audible wake ack (blocking so the user hears it once)
     try:
-        # If your wake_ack supports a non-blocking/beep mode, you can use it instead:
-        # wake_ack(tts, blocking=False)
-        tts.speak("Ultron is listening.")
+        wake_ack(tts, blocking=True)
     except Exception:
-        pass
+        try:
+            tts.speak("Ultron is listening.")
+        except Exception:
+            pass
+    time.sleep(0.10)
 
     print("[Ultron] Capturing command...")
     try:
@@ -526,37 +689,112 @@ def on_wake():
     print(f"[Ultron] Heard: {cmd}")
     handle_command(cmd)
 
-
 def main():
     os.makedirs("logs", exist_ok=True)
+
     mode = (WAKE_ENGINE or "").strip().lower()
     print(f"[Ultron] Starting with trigger mode: {mode or 'hotkey'}")
+    print("[Ultron] GOOGLE_API_KEY present:",
+          bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")))
     log_event({"type": "boot", "trigger": mode or "hotkey"})
 
     # Startup line (blocking so you hear it once)
     tts.speak_blocking("Ultron is standing by.", timeout=2.5)
 
-    ww = WakeWordEngine(on_wake=on_wake)
-    ww.start()
+    # ==== NEW: start a global keyboard listener for ESC cancel ================
+    def _kb_on_press(key):
+        if key == keyboard.Key.esc:
+            print("[Ultron][TTS] ESC pressed → cancel speech")
+            stop_speaking()
+
+    kb_listener = keyboard.Listener(on_press=_kb_on_press)
+    kb_listener.daemon = True
+    kb_listener.start()
+    # ==========================================================================
+
+    # Common hotkey callback used by hotkey-only and both-modes
+    def _on_hotkey():
+        # Strict hotkey guard: cooldown + physical key confirmation
+        global _LAST_HOTKEY_TS
+        with _HOTKEY_LOCK:
+            now = time.time()
+            if (now - _LAST_HOTKEY_TS) < _HOTKEY_COOLDOWN_SEC:
+                log_event({"type": "hotkey_ignored", "reason": "cooldown"})
+                return
+            if not _hotkey_confirm_pressed(_HOTKEY_REQS, samples=3, interval_ms=50):
+                log_event({"type": "hotkey_ignored", "reason": "not_confirmed"})
+                return
+            _LAST_HOTKEY_TS = now
+
+        log_event({"type": "hotkey_trigger", "combo": HOTKEY})
+        on_wake()
+
+    trigger = None
+    ww = None
 
     try:
-        while True:
-            time.sleep(0.5)
+        if mode == "hotkey":
+            trigger = HotkeyEngine(HOTKEY, _on_hotkey)
+            trigger.start()
+            print(f"[Ultron] Registered hotkey {HOTKEY} (press to talk).")
+
+            while True:
+                time.sleep(0.5)
+
+        elif mode == "both":
+            trigger = HotkeyEngine(HOTKEY, _on_hotkey)
+            try:
+                trigger.start()
+            except Exception:
+                trigger = None
+
+            ww = WakeWordEngine(on_wake=on_wake)
+            try:
+                ww.start()
+            except Exception as e:
+                print(f"[Ultron][WakeWord] Failed to start wakeword engine: {e}")
+                ww = None
+
+            print(f"[Ultron] Running both hotkey and wakeword triggers. Press {HOTKEY} or speak the wake word.")
+            while True:
+                time.sleep(0.5)
+
+        else:
+            # Default wakeword path (openwakeword or porcupine based on WAKE_ENGINE)
+            ww = WakeWordEngine(on_wake=on_wake)
+            ww.start()
+            print("[Ultron] Wakeword listener started.")
+            while True:
+                time.sleep(0.5)
+
     except KeyboardInterrupt:
         print("\n[Ultron] Shutting down...")
     finally:
+        # Stop trigger if started
         try:
-            ww.stop()
+            if trigger:
+                trigger.stop()
         except Exception:
             pass
-        # Shutdown line (blocking)
+        try:
+            if ww:
+                ww.stop()
+        except Exception:
+            pass
+
+        # Stop keyboard listener cleanly
+        try:
+            kb_listener.stop()
+        except Exception:
+            pass
+
+        # Common shutdown tasks
         tts.speak_blocking("Ultron shutting down.", timeout=3.0)
         try:
             tts.shutdown(timeout=3.0)
         except Exception:
             pass
         log_event({"type": "shutdown"})
-
 
 if __name__ == "__main__":
     main()
