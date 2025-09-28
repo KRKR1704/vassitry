@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Tuple
@@ -63,7 +64,7 @@ def _geocode_city(city: str) -> Tuple[float, float, str, str]:
         raise ValueError("Couldn't find location: <empty>")
 
     # Build normalized candidates (dedup while preserving order)
-    candidates = []
+    candidates: list[str] = []
 
     # 1) as-is
     candidates.append(raw)
@@ -94,7 +95,9 @@ def _geocode_city(city: str) -> Tuple[float, float, str, str]:
     lowered = raw.lower()
     for long, iso in country_norms.items():
         if long in lowered:
-            candidates.append(lowered.replace(long, iso).title().replace(" Us", " US").replace(" Gb", " GB"))
+            # Title-case the whole string after replacement to keep capitalization tidy
+            candidates.append(lowered.replace(long, iso).title()
+                              .replace(" Us", " US").replace(" Gb", " GB"))
 
     # 3) Keep only City + last token (e.g., "Newark, US" from "Newark, New Jersey, US")
     parts = [p.strip() for p in raw.split(",") if p.strip()]
@@ -106,7 +109,7 @@ def _geocode_city(city: str) -> Tuple[float, float, str, str]:
 
     # Deduplicate while preserving order
     seen = set()
-    deduped = []
+    deduped: list[str] = []
     for c in candidates:
         c2 = c.strip()
         if c2.lower() not in seen:
@@ -134,7 +137,6 @@ def _geocode_city(city: str) -> Tuple[float, float, str, str]:
     pieces = [hit.get("name"), hit.get("admin1"), hit.get("country_code")]
     label = ", ".join([p for p in pieces if p])
     return lat, lon, tz_name, label or raw
-
 
 
 def _fetch_openmeteo_daily(
@@ -195,7 +197,20 @@ def get_weather_sync(city: str | None, when: str | None = "today") -> WeatherRes
     """
     # Clean up accidental quotes/spaces from .env/user speech
     default_city = (DEFAULT_CITY or "").strip().strip('"').strip("'")
-    city_in = (city or default_city).strip().strip('"').strip("'")
+
+    # Start from the explicit city (if any); don't fall back yet
+    city_in = (city or "").strip().strip('"').strip("'")
+
+    # If the "city" is actually a time-word (e.g., "tomorrow", "s tomorrow"), ignore it
+    if city_in:
+        # strip leading "'s " or "s " (from "what's", "how's")
+        city_in = re.sub(r"^\s*'?s\s+", "", city_in, flags=re.I)
+        # drop if it contains only time words / no real letters
+        if re.search(r"\b(today|tomorrow|yesterday|now)\b", city_in, re.I):
+            city_in = ""
+
+    # Fall back to DEFAULT_CITY if needed
+    city_in = city_in or default_city
     if not city_in:
         raise ValueError("No city set. Set DEFAULT_CITY in .env or say a city name.")
 
@@ -207,16 +222,16 @@ def get_weather_sync(city: str | None, when: str | None = "today") -> WeatherRes
 
     if when_norm in ("today", "tomorrow", "yesterday"):
         tmin_c, tmax_c, desc = _fetch_openmeteo_daily(lat, lon, tz_name, when_norm)
-        if math.isnan(tmin_c) and math.isnan(tmax_c):
+        if (tmin_c is None or math.isnan(tmin_c)) and (tmax_c is None or math.isnan(tmax_c)):
             avg_c = None
-        elif math.isnan(tmin_c):
+        elif tmin_c is None or math.isnan(tmin_c):
             avg_c = tmax_c
-        elif math.isnan(tmax_c):
+        elif tmax_c is None or math.isnan(tmax_c):
             avg_c = tmin_c
         else:
             avg_c = (tmin_c + tmax_c) / 2.0
 
-        temp_f = (avg_c * 9 / 5 + 32) if (isinstance(avg_c, (int, float)) and not math.isnan(avg_c)) else None
+        temp_f = (avg_c * 9 / 5 + 32) if (isinstance(avg_c, (int, float)) and avg_c is not None and not math.isnan(avg_c)) else None
         return WeatherResult(
             location=loc_label,
             when_label=when_norm,
@@ -265,6 +280,7 @@ def speak_weather_sync(tts, city: str | None, when: str | None):
     """
     try:
         w = get_weather_sync(city, when)
+
         # Unit selection
         use_f = (UNITS == "imperial") or (
             UNITS == "auto" and (w.location.endswith(", US") or "United States" in w.location)
@@ -272,27 +288,31 @@ def speak_weather_sync(tts, city: str | None, when: str | None):
 
         unit = "degrees Fahrenheit" if use_f else "degrees Celsius"
         temp_val = None
-        if isinstance(w.temp_c, (int, float)) and not math.isnan(w.temp_c):
+        if isinstance(w.temp_c, (int, float)) and w.temp_c is not None and not math.isnan(w.temp_c):
             temp_val = round(w.temp_f) if use_f else round(w.temp_c)
 
-        if w.when_label in ("today", "tomorrow", "yesterday"):
+        when_spoken = w.when_label  # "today" | "tomorrow" | "yesterday" | "now"
+
+        if when_spoken in ("today", "tomorrow", "yesterday"):
             if temp_val is not None:
-                tts.speak(f"In {w.location}, {w.when_label}, around {temp_val} {unit} with {w.description}.")
+                tts.speak(f"In {w.location}, {when_spoken}, around {temp_val} {unit} with {w.description}.")
             else:
-                tts.speak(f"In {w.location}, {w.when_label}, conditions are {w.description}.")
+                tts.speak(f"In {w.location}, {when_spoken}, conditions are {w.description}.")
         else:  # now
             if temp_val is not None:
-                tts.speak(f"In {w.location}, {w.when_label}, it's {temp_val} {unit} with {w.description}.")
+                tts.speak(f"In {w.location} right now, it's {temp_val} {unit} with {w.description}.")
             else:
                 tts.speak(f"Sorry, I couldn't get the weather for {w.location} right now.")
+
     except requests.RequestException as e:
         print(f"[Ultron][Weather] Network error: {e!r}")
         tts.speak("Weather ran into a network issue. Please check your internet connection.")
     except Exception as e:
         print(f"[Ultron][Weather] Error: {e!r}")
-        if "Couldn't find location" in str(e):
+        msg = str(e)
+        if "Couldn't find location" in msg:
             tts.speak("I couldn't find that location. Please say the city name, like ‘weather in Hyderabad’.")
-        elif "No city set" in str(e):
+        elif "No city set" in msg:
             tts.speak("Please set a default city in your dot env or say a city name.")
         else:
             tts.speak("Weather ran into an issue. Please try again.")
