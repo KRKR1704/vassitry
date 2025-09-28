@@ -47,6 +47,11 @@ TTS_STARTUP_TEST = os.getenv("TTS_STARTUP_TEST", "0").strip() in ("1", "true", "
 # Wait after wake-ack voice
 ACK_BLOCKING_SECS = float(os.getenv("ACK_BLOCKING_SECS", "1.2"))
 
+#weather
+DEFAULT_CITY = os.getenv("DEFAULT_CITY", "Newark, NJ")
+UNITS = os.getenv("UNITS", "auto")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
+
 # Logging
 LOGS_PATH = os.path.join("logs", "events.jsonl")
 os.makedirs("logs", exist_ok=True)
