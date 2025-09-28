@@ -170,7 +170,7 @@ def _detect_when(text: str) -> str:
     if "tomorrow" in tl:  return "tomorrow"
     if "now" in tl or "right now" in tl or "currently" in tl: return "now"
     if re.search(r"\btoday\b", tl): return "today"
-    return "today" 
+    return "today"
 
 def _extract_city(text: str) -> str | None:
     # priority to quoted city
@@ -182,6 +182,45 @@ def _extract_city(text: str) -> str | None:
     if m:
         return m.group(1).strip(" .!?")
     return None
+
+# ===== Site-search helpers =====
+def _extract_site_and_query(text: str) -> tuple[str | None, str | None]:
+    """
+    Handles:
+      - search <query> on <site>
+      - search <site> for <query>
+      - find <query> in <site>
+      - open <site> and search/find <query>
+      - search for "<query>" on <site>
+      - search "<query>"  (no site)
+    Returns (site, query) where either can be None.
+    """
+    s = _normalize(text)
+    quoted = _extract_quoted(s)
+
+    patterns = [
+        r"(?:^|\b)(?:search|find)\s+(?P<q>.+?)\s+(?:on|in)\s+(?P<site>[^\s,]+)\b",
+        r"(?:^|\b)(?:search|find)\s+(?P<site>[^\s,]+)\s+(?:for|about)\s+(?P<q>.+)$",
+        r"(?:^|\b)(?:open|visit|go to)\s+(?P<site>[^\s,]+).*?(?:search|find)\s+(?:for\s+)?(?P<q>.+)$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, s, re.I)
+        if m:
+            site = (m.group("site") or "").strip(" .,'\"")
+            q = quoted or (m.group("q") or "").strip(" .,'\"")
+            return (site or None), (q or None)
+
+    m = re.search(r"(?:^|\b)search(?:\s+for)?\s+(.+)$", s, re.I)
+    if m:
+        q = quoted or m.group(1).strip(" .,'\"")
+        return None, (q or None)
+
+    m = re.search(r"(?:^|\b)find\s+(.+)$", s, re.I)
+    if m:
+        q = quoted or m.group(1).strip(" .,'\"")
+        return None, (q or None)
+
+    return None, None
 
 # ===== Intent parsing =====
 def parse_intent(text: str) -> IntentResult:
@@ -288,13 +327,13 @@ def parse_intent(text: str) -> IntentResult:
         return IntentResult("battery_query", None)
 
     # ===== Power =====
-    if _has(t, r"\b(hibernate)\b"): return IntentResult("power_sleep", None)
-    if _has(t, r"\b(put\s+(?:the\s+)?(?:pc|computer|system)\s+to\s+sleep|go\s+to\s+sleep|sleep\s+now|^sleep$)\b"):
+    if _has(tl, r"\b(hibernate)\b"): return IntentResult("power_sleep", None)
+    if _has(tl, r"\b(put\s+(?:the\s+)?(?:pc|computer|system)\s+to\s+sleep|go\s+to\s+sleep|sleep\s+now|^sleep$)\b"):
         return IntentResult("power_sleep", None)
-    if re.search(r"\b(shut\s*down|power\s*off|turn\s*off)\b(?!.*\b(wi-?fi|wifi|wireless|wlan)\b)", t, re.I):
+    if re.search(r"\b(shut\s*down|power\s*off|turn\s*off)\b(?!.*\b(wi-?fi|wifi|wireless|wlan)\b)", tl, re.I):
         return IntentResult("power_shutdown", None)
-    if _has(t, r"\b(restart|reboot)\b"): return IntentResult("power_restart", None)
-    if _has(t, r"\b(lock|lock\s+(?:the\s+)?(?:pc|computer|screen))\b"):
+    if _has(tl, r"\b(restart|reboot)\b"): return IntentResult("power_restart", None)
+    if _has(tl, r"\b(lock|lock\s+(?:the\s+)?(?:pc|computer|screen))\b"):
         return IntentResult("power_lock", None)
 
     # ===== WEATHER =====
@@ -303,8 +342,22 @@ def parse_intent(text: str) -> IntentResult:
         if m:
             city = m.groupdict().get("city") or _extract_city(s)
             when = _detect_when(s)
-            city = (city.strip(" ?.,")) if city else None
+            city = (city.strip(" ?.,"))
+            city = city if city else None
             return IntentResult("weather.get", None, slots={"city": city, "when": when})
+
+    # ===== Site search (generic) =====
+    # Put BEFORE raw URL detection and before the generic "open" handler.
+    if _has(s, r"\b(search|find)\b"):
+        site, query = _extract_site_and_query(s)
+        if site or query:
+            site_mapped = None
+            if site:
+                raw = site.strip().lower()
+                mapped = _site_alias(raw) or _alias_lookup(raw)
+                # Ignore app tokens like "app:whatsapp" for site searching
+                site_mapped = mapped if (mapped and not str(mapped).startswith("app:")) else site
+            return IntentResult("site.search", None, slots={"site": site_mapped or site, "query": query})
 
     # ===== URL/domain anywhere → open_site (preserve path/query/fragment) =====
     m = URL_OR_DOMAIN.search(t)
@@ -341,11 +394,8 @@ def parse_intent(text: str) -> IntentResult:
         # Known alias (common name)
         alias = _alias_lookup(obj.lower())
         if alias:
-            # Alias may be a domain or a special app token
             if alias.startswith("app:"):
-                # Keep as open_site with app token; opener handles it
                 return IntentResult("open_site", alias)
-            # Normalize to full https URL
             return IntentResult("open_site", _normalize_url_or_domain(alias))
 
         # Explicit URL or domain in the object
