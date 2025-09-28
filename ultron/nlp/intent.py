@@ -1,12 +1,14 @@
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import get_close_matches
 from urllib.parse import urlparse
 
 @dataclass
 class IntentResult:
-    intent: str          # e.g., "open_site", "open_app", "wifi_on", "unknown", etc.
-    entity: str | None   # site/app/target string or None
+    intent: str                # e.g., "open_site", "open_app", "wifi_on", "unknown", etc.
+    entity: str | None         # site/app/target string or None
+    name: str | None = None    # optional extra name (e.g., device name)
+    slots: dict = field(default_factory=dict)  # optional slots for extra data
 
 # --- Website aliases (spoken names -> canonical targets) ---
 # NOTE: "whatsapp" is mapped to a special token for the DESKTOP app.
@@ -152,6 +154,35 @@ def _normalize_url_or_domain(raw: str) -> str:
     frag = f"#{p.fragment}" if p.fragment else ""
     return f"https://{host}{path}{qs}{frag}" if host else val
 
+# ===== Weather helpers =====
+_WEATHER_PATTERNS = [
+    # "weather", "temperature", "forecast" optionally followed by "in <city>"
+    re.compile(r"\b(weather|temperature|forecast)\b(?:\s+(?:for|in|at)\s+(?P<city>.+))?", re.I),
+    # "how's the weather in <city>"
+    re.compile(r"\bhow\s*(?:is|’s|s)\s*the\s*weather(?:\s+(?:for|in|at)\s+(?P<city>.+))?", re.I),
+    # direct requests like "tell me weather in <city>"
+    re.compile(r"\b(tell|say)\s+(?:me\s+)?(?:about\s+)?(?:the\s+)?weather(?:\s+(?:for|in|at)\s+(?P<city>.+))?", re.I),
+]
+
+def _detect_when(text: str) -> str:
+    tl = text.lower()
+    if "yesterday" in tl: return "yesterday"
+    if "tomorrow" in tl:  return "tomorrow"
+    if "now" in tl or "right now" in tl or "currently" in tl: return "now"
+    if re.search(r"\btoday\b", tl): return "today"
+    return "today" 
+
+def _extract_city(text: str) -> str | None:
+    # priority to quoted city
+    q = _extract_quoted(text)
+    if q: return q.strip()
+
+    # after prepositions like "in/at/for"
+    m = re.search(r"\b(?:in|at|for)\s+([A-Za-z0-9 ,.'\-]+)$", text, re.I)
+    if m:
+        return m.group(1).strip(" .!?")
+    return None
+
 # ===== Intent parsing =====
 def parse_intent(text: str) -> IntentResult:
     if not text:
@@ -265,6 +296,15 @@ def parse_intent(text: str) -> IntentResult:
     if _has(t, r"\b(restart|reboot)\b"): return IntentResult("power_restart", None)
     if _has(t, r"\b(lock|lock\s+(?:the\s+)?(?:pc|computer|screen))\b"):
         return IntentResult("power_lock", None)
+
+    # ===== WEATHER =====
+    for pat in _WEATHER_PATTERNS:
+        m = pat.search(s)
+        if m:
+            city = m.groupdict().get("city") or _extract_city(s)
+            when = _detect_when(s)
+            city = (city.strip(" ?.,")) if city else None
+            return IntentResult("weather.get", None, slots={"city": city, "when": when})
 
     # ===== URL/domain anywhere → open_site (preserve path/query/fragment) =====
     m = URL_OR_DOMAIN.search(t)
