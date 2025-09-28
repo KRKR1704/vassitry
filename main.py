@@ -259,14 +259,18 @@ def handle_command(text: str):
         tts.speak_blocking(said, timeout=2.5)
 
         ok = False
-        if open_browser_app is not None:
-            try:
-                ok = open_browser_app(app)
-            except Exception:
-                ok = False
-        if not ok and open_app is not None:
+
+        # Try desktop app first
+        if open_app is not None:
             try:
                 ok = open_app(app)
+            except Exception:
+                ok = False
+
+        # Fallback → browser app
+        if not ok and open_browser_app is not None:
+            try:
+                ok = open_browser_app(app)
             except Exception:
                 ok = False
 
