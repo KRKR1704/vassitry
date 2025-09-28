@@ -5,10 +5,12 @@ from urllib.parse import urlparse
 
 @dataclass
 class IntentResult:
-    intent: str          # "open_site" | "open_app" | "unknown"
-    entity: str | None   # site domain or app name
+    intent: str          # e.g., "open_site", "open_app", "wifi_on", "unknown", etc.
+    entity: str | None   # site/app/target string or None
 
-# --- Website aliases ---
+# --- Website aliases (spoken names -> canonical targets) ---
+# NOTE: "whatsapp" is mapped to a special token for the DESKTOP app.
+# If you prefer web, change "app:whatsapp" to "web.whatsapp.com".
 COMMON_MAP = {
     "google": "google.com",
     "gmail": "mail.google.com",
@@ -17,7 +19,7 @@ COMMON_MAP = {
     "chatgpt": "chat.openai.com",
     "linkedin": "linkedin.com",
     "outlook": "outlook.live.com",
-    "whatsapp": "web.whatsapp.com",
+    "whatsapp": "app:whatsapp",  # desktop app preference
     "canvas": "canvas.ubuffalo.edu",
     "ublearns": "ublearns.buffalo.edu",
     "reddit": "reddit.com",
@@ -27,7 +29,7 @@ COMMON_MAP = {
     "stack overflow": "stackoverflow.com",
 }
 
-# --- Browser/app aliases ---
+# --- Browser/app aliases (spoken names -> app id) ---
 APP_BROWSER_ALIASES = {
     "chrome": "chrome",
     "google chrome": "chrome",
@@ -44,7 +46,7 @@ URL_OR_DOMAIN = re.compile(
     re.I
 )
 
-# ----- Helpers -----
+# ===== Helpers =====
 def _normalize(s: str) -> str:
     t = (s or "").strip()
     t = re.sub(r"[\u2018\u2019]", "'", t)
@@ -91,12 +93,66 @@ def _canonical_device_hint(s: str) -> str | None:
     if re.search(r"\b(tv|monitor|display)\b", s): return "tv"
     return s
 
-# Keys
-_AUDIO_DEVICE_KEYS = r"\b(audio|sound|output|device|speaker|speakers|playback)\b"
-_SWITCH_TRIGGERS   = r"\b(set|switch|change|make|use|route|default)\b"
-_LIST_TRIGGERS     = r"\b(list|show|what(?:'s| is)|available|enumerate|display)\b"
+# --- Domain canonicalization (domain -> canonical domain or special token) ---
+_DOMAIN_CANON = {
+    # Twitter -> X
+    "twitter.com": "x.com",
+    "www.twitter.com": "x.com",
+    "mobile.twitter.com": "x.com",
 
+    # WhatsApp: generic domain -> desktop app token (handled by opener)
+    "whatsapp.com": "app:whatsapp",
+    "www.whatsapp.com": "app:whatsapp",
 
+    # Keep explicit web.whatsapp.com as web
+    "web.whatsapp.com": "web.whatsapp.com",
+}
+
+def _site_alias(key: str) -> str | None:
+    """
+    Map a domain-ish key or a common-name key to a canonical target.
+    Returns a domain (e.g., 'x.com'), a full URL, a special token like 'app:whatsapp',
+    or None if no mapping applies.
+    """
+    if not key:
+        return None
+    k = key.strip().lower()
+    k = re.sub(r"^www\.", "", k)
+
+    # 1) Domain-level canonicalization
+    if k in _DOMAIN_CANON:
+        return _DOMAIN_CANON[k]
+
+    # 2) Common-name aliasing
+    if k in COMMON_MAP:
+        return COMMON_MAP[k]
+
+    return None
+
+def _normalize_url_or_domain(raw: str) -> str:
+    """
+    Preserve path/query/fragment, normalize host, and apply domain canonicalization.
+    If the result is a special app token (e.g., 'app:whatsapp'), return that token.
+    """
+    val = raw.strip().rstrip(".,!?")
+    url = val if re.match(r"^https?://", val, re.I) else f"https://{val}"
+    p = urlparse(url)
+
+    host = p.netloc.lower()
+    host = re.sub(r"^www\.", "", host)
+
+    mapped = _site_alias(host)
+    if mapped and mapped.startswith("app:"):
+        return mapped
+    if mapped and re.search(r"\.[a-z]{2,}$", mapped):
+        host = mapped
+
+    path = p.path or ""
+    qs = f"?{p.query}" if p.query else ""
+    frag = f"#{p.fragment}" if p.fragment else ""
+    return f"https://{host}{path}{qs}{frag}" if host else val
+
+# ===== Intent parsing =====
 def parse_intent(text: str) -> IntentResult:
     if not text:
         return IntentResult("unknown", None)
@@ -141,16 +197,14 @@ def parse_intent(text: str) -> IntentResult:
         if _has(s, r"\b(mute)\b"):      return IntentResult("volume_mute", None)
         if _has(s, r"\b(unmute)\b"):    return IntentResult("volume_unmute", None)
 
-        # set to N: "to 70", "set volume 30", "volume 50"
-        if _has(s, r"\bto\s+\d{1,3}\b"):
-            n = _extract_first_int(s)
-            if n is not None: return IntentResult("volume_set", str(n))
-        if _has(s, r"\b(set|change|adjust)\b") and _extract_first_int(s) is not None:
-            return IntentResult("volume_set", str(_extract_first_int(s)))
-        if re.fullmatch(r".*\bvolume\s+\d{1,3}\b.*", s, re.I):
-            return IntentResult("volume_set", str(_extract_first_int(s)))
+        n = _extract_first_int(s)
+        if _has(s, r"\bto\s+\d{1,3}\b") and n is not None:
+            return IntentResult("volume_set", str(n))
+        if _has(s, r"\b(set|change|adjust)\b") and n is not None:
+            return IntentResult("volume_set", str(n))
+        if re.fullmatch(r".*\bvolume\s+\d{1,3}\b.*", s, re.I) and n is not None:
+            return IntentResult("volume_set", str(n))
 
-        # up/down (+ optional "by N")
         if _has(s, r"\b(increase|raise|turn\s*up)\b"):
             m = re.search(r"\bby\s+(\d{1,3})\b", s, re.I)
             return IntentResult("volume_up", m.group(1) if m else None)
@@ -162,13 +216,13 @@ def parse_intent(text: str) -> IntentResult:
 
     # ===== Brightness =====
     if _has(s, r"\b(bright|brightness|screen)\b"):
-        if _has(s, r"\bto\s+\d{1,3}\b") and _has(s, r"\bbright"):
-            n = _extract_first_int(s)
-            if n is not None: return IntentResult("brightness_set", str(n))
-        if _has(s, r"\b(set|change|adjust)\s+(?:the\s+)?brightness\b") and _extract_first_int(s) is not None:
-            return IntentResult("brightness_set", str(_extract_first_int(s)))
-        if re.fullmatch(r".*\bbrightness\s+\d{1,3}\b.*", s, re.I):
-            return IntentResult("brightness_set", str(_extract_first_int(s)))
+        n = _extract_first_int(s)
+        if _has(s, r"\bto\s+\d{1,3}\b") and _has(s, r"\bbright") and n is not None:
+            return IntentResult("brightness_set", str(n))
+        if _has(s, r"\b(set|change|adjust)\s+(?:the\s+)?brightness\b") and n is not None:
+            return IntentResult("brightness_set", str(n))
+        if re.fullmatch(r".*\bbrightness\s+\d{1,3}\b.*", s, re.I) and n is not None:
+            return IntentResult("brightness_set", str(n))
 
         if _has(s, r"\b(increase|raise|brighten|turn\s*up)\b"):
             m = re.search(r"\bby\s+(\d{1,3})\b", s, re.I)
@@ -212,25 +266,21 @@ def parse_intent(text: str) -> IntentResult:
     if _has(t, r"\b(lock|lock\s+(?:the\s+)?(?:pc|computer|screen))\b"):
         return IntentResult("power_lock", None)
 
-    # ===== URL/domain anywhere → open_site =====
+    # ===== URL/domain anywhere → open_site (preserve path/query/fragment) =====
     m = URL_OR_DOMAIN.search(t)
     if m:
-        raw = m.group("url").rstrip(".,!?")
-        parsed = urlparse(raw if raw.startswith("http") else f"https://{raw}")
-        host_or_path = parsed.netloc or parsed.path.strip("/")
-        if host_or_path:
-            site = re.sub(r"^www\.", "", host_or_path)
-            alias = _site_alias(site)
-            site = alias if alias else site
-            return IntentResult("open_site", site)
+        raw = m.group("url")
+        target = _normalize_url_or_domain(raw)
+        # Keep 'open_site' even for app tokens; opener should handle "app:*"
+        return IntentResult("open_site", target)
 
     # ===== Audio output devices =====
-    if _has(s, _LIST_TRIGGERS) and _has(s, _AUDIO_DEVICE_KEYS):
+    if _has(s, r"\b(list|show|what(?:'s| is)|available|enumerate|display)\b") and _has(s, r"\b(audio|sound|output|device|speaker|speakers|playback)\b"):
         return IntentResult("audio_list_outputs", None)
     if _has(s, r"\b(outputs|playback devices|audio devices|speakers)\b") and _has(s, r"\b(list|show|available)\b"):
         return IntentResult("audio_list_outputs", None)
 
-    if (_has(s, _SWITCH_TRIGGERS) and _has(s, _AUDIO_DEVICE_KEYS)) or _has(s, r"\b(default output)\b"):
+    if (_has(s, r"\b(set|switch|change|make|use|route|default)\b") and _has(s, r"\b(audio|sound|output|device|speaker|speakers|playback)\b")) or _has(s, r"\b(default output)\b"):
         target = _extract_quoted(s) or _extract_after_preposition(s)
         if target:
             return IntentResult("audio_switch_output", _canonical_device_hint(target))
@@ -243,22 +293,35 @@ def parse_intent(text: str) -> IntentResult:
         obj = _extract_quoted(s) or re.sub(r"\b(open|launch|start|go to|goto|visit)\b", "", s, flags=re.I).strip()
         obj = re.sub(r"^(the|a|an)\s+", "", obj, flags=re.I).strip()
 
+        # Browser app?
         app = _browser_app_lookup(obj.lower())
-        if app: return IntentResult("open_app", app)
+        if app:
+            return IntentResult("open_app", app)
 
+        # Known alias (common name)
         alias = _alias_lookup(obj.lower())
-        if alias: return IntentResult("open_site", alias)
+        if alias:
+            # Alias may be a domain or a special app token
+            if alias.startswith("app:"):
+                # Keep as open_site with app token; opener handles it
+                return IntentResult("open_site", alias)
+            # Normalize to full https URL
+            return IntentResult("open_site", _normalize_url_or_domain(alias))
 
+        # Explicit URL or domain in the object
         m = URL_OR_DOMAIN.search(obj)
         if m:
-            raw = m.group("url").rstrip(".,!?")
-            parsed = urlparse(raw if raw.startswith("http") else f"https://{raw}")
-            host_or_path = parsed.netloc or parsed.path.strip("/")
-            if host_or_path:
-                site = re.sub(r"^www\.", "", host_or_path)
-                return IntentResult("open_site", site)
+            raw = m.group("url")
+            return IntentResult("open_site", _normalize_url_or_domain(raw))
 
-        # fallback: assume it's a site term like "facebook"
+        # Fallback: try domain canonicalization on the raw token (e.g., "whatsapp", "twitter")
+        mapped = _site_alias(obj)
+        if mapped:
+            if mapped.startswith("app:"):
+                return IntentResult("open_site", mapped)
+            return IntentResult("open_site", _normalize_url_or_domain(mapped))
+
+        # Last resort: treat it like a site keyword; opener can decide scheme
         return IntentResult("open_site", obj)
 
     return IntentResult("unknown", None)
