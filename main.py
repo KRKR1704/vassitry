@@ -23,7 +23,14 @@ from ultron.tts import TTS
 from ultron.nlp.intent import parse_intent
 from ultron.skills.browser import open_url
 from ultron.skills import weather as weather_skill
-from ultron.skills import site_search  # <-- NEW: site search module
+from ultron.skills import site_search
+
+# ---- minimal logging switch ----
+DEBUG = False  # set True while debugging; False to silence startup logs
+
+def log_debug(msg: str):
+    if DEBUG:
+        print(msg)
 
 # --- Optional skills (import defensively) ---
 try:
@@ -44,11 +51,10 @@ except Exception:
 # Gemini fallback (log status so you know if it's active)
 try:
     from ultron.skills.gemini import ask_gemini
-    print("[Ultron][Gemini] ask_gemini() loaded. Key present:",
-          bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")))
+    log_debug(f"[Ultron][Gemini] ask_gemini() loaded. Key present: {bool(os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY'))}")
 except Exception as e:
     ask_gemini = None
-    print(f"[Ultron][Gemini] disabled: {e}")
+    log_debug(f"[Ultron][Gemini] disabled: {e}")
 
 from ultron.ack import wake_ack
 from ultron.hotkey import HotkeyEngine
@@ -702,7 +708,7 @@ def handle_command(text: str):
 
 # -------- trigger paths --------
 def on_wake():
-    print("[Ultron] Listening (triggered)…")
+    log_debug("[Ultron] Listening (triggered)…")
     # Audible wake ack (blocking so the user hears it once)
     try:
         wake_ack(tts, blocking=True)
@@ -713,7 +719,7 @@ def on_wake():
             pass
     time.sleep(0.10)
 
-    print("[Ultron] Capturing command...")
+    log_debug("[Ultron] Capturing command...")
     try:
         cmd = listener.listen_once(timeout=10, phrase_time_limit=15)
     except Exception as e:
@@ -727,16 +733,15 @@ def on_wake():
         log_event({"type": "listen_timeout"})
         return
 
-    print(f"[Ultron] Heard: {cmd}")
+    log_debug(f"[Ultron] Heard: {cmd}")
     handle_command(cmd)
 
 def main():
     os.makedirs("logs", exist_ok=True)
 
     mode = (WAKE_ENGINE or "").strip().lower()
-    print(f"[Ultron] Starting with trigger mode: {mode or 'hotkey'}")
-    print("[Ultron] GOOGLE_API_KEY present:",
-          bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")))
+    log_debug(f"[Ultron] Starting with trigger mode: {mode or 'hotkey'}")
+    log_debug(f"[Ultron] GOOGLE_API_KEY present: {bool(os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY'))}")
     log_event({"type": "boot", "trigger": mode or "hotkey"})
 
     # Startup line (blocking so you hear it once)
@@ -745,7 +750,7 @@ def main():
     # ==== NEW: start a global keyboard listener for ESC cancel ================
     def _kb_on_press(key):
         if key == keyboard.Key.esc:
-            print("[Ultron][TTS] ESC pressed → cancel speech")
+            log_debug("[Ultron][TTS] ESC pressed → cancel speech")
             stop_speaking()
 
     kb_listener = keyboard.Listener(on_press=_kb_on_press)
@@ -777,7 +782,7 @@ def main():
         if mode == "hotkey":
             trigger = HotkeyEngine(HOTKEY, _on_hotkey)
             trigger.start()
-            print(f"[Ultron] Registered hotkey {HOTKEY} (press to talk).")
+            log_debug(f"[Ultron] Registered hotkey {HOTKEY} (press to talk).")
 
             while True:
                 time.sleep(0.5)
@@ -796,7 +801,7 @@ def main():
                 print(f"[Ultron][WakeWord] Failed to start wakeword engine: {e}")
                 ww = None
 
-            print(f"[Ultron] Running both hotkey and wakeword triggers. Press {HOTKEY} or speak the wake word.")
+            log_debug(f"[Ultron] Running both hotkey and wakeword triggers. Press {HOTKEY} or speak the wake word.")
             while True:
                 time.sleep(0.5)
 
@@ -804,12 +809,12 @@ def main():
             # Default wakeword path (openwakeword or porcupine based on WAKE_ENGINE)
             ww = WakeWordEngine(on_wake=on_wake)
             ww.start()
-            print("[Ultron] Wakeword listener started.")
+            log_debug("[Ultron] Wakeword listener started.")
             while True:
                 time.sleep(0.5)
 
     except KeyboardInterrupt:
-        print("\n[Ultron] Shutting down...")
+        log_debug("\n[Ultron] Shutting down...")
     finally:
         # Stop trigger if started
         try:
