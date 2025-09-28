@@ -22,6 +22,7 @@ from ultron.listener import Listener
 from ultron.tts import TTS
 from ultron.nlp.intent import parse_intent
 from ultron.skills.browser import open_url
+from ultron.skills import weather as weather_skill
 
 # --- Optional skills (import defensively) ---
 try:
@@ -556,7 +557,15 @@ def handle_command(text: str):
             tts.speak("Connecting to Wi-Fi networks isn't available on this build.")
             log_action("wifi_connect", "not_supported", ssid=ssid)
         return
-
+    # ---------- Weather ----------
+    if intent.intent == "weather.get":
+        slots = intent.slots or {}
+        city = slots.get("city")
+        when = slots.get("when") or "today"
+        print(f"[Ultron][Weather][DBG] slots={slots} city={city!r} when={when!r}")
+        weather_skill.speak_weather_sync(tts, city, when)
+        log_action("weather.get", "success", city=city, when=when)
+        return
     # ---------- Power ----------
     if intent.intent == "power_sleep" and sysctl:
         tts.speak("Going to sleep.")
