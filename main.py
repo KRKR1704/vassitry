@@ -14,7 +14,7 @@ import ctypes
 import threading
 from datetime import datetime, UTC
 
-from pynput import keyboard  # <-- NEW: for Esc-to-cancel
+from pynput import keyboard
 
 from ultron.config import LOGS_PATH, BROWSER, WAKE_ENGINE, HOTKEY
 from ultron.wakeword import WakeWordEngine
@@ -23,6 +23,7 @@ from ultron.tts import TTS
 from ultron.nlp.intent import parse_intent
 from ultron.skills.browser import open_url
 from ultron.skills import weather as weather_skill
+from ultron.skills import site_search  # <-- NEW: site search module
 
 # --- Optional skills (import defensively) ---
 try:
@@ -64,7 +65,6 @@ def stop_speaking():
     """Signal any ongoing TTS to stop ASAP."""
     SPEECH_CANCEL.set()
     try:
-        # If your TTS class exposes a stop() / cancel() method, call it.
         if hasattr(tts, "stop"):
             tts.stop()
     except Exception:
@@ -119,7 +119,6 @@ def _speak_chunks(text: str, chunk_size: int = 350):
 
     text = text.strip()
     if len(text) <= chunk_size:
-        # single shot
         try:
             tts.speak(text)
         except Exception:
@@ -130,7 +129,6 @@ def _speak_chunks(text: str, chunk_size: int = 350):
     for token in text.replace("\n", " ").split(" "):
         if SPEECH_CANCEL.is_set():
             break
-        # flush chunk if it would overflow
         if sum(len(x) for x in buf) + len(buf) + len(token) > chunk_size:
             try:
                 tts.speak(" ".join(buf))
@@ -153,9 +151,6 @@ _GENERIC_AUDIO_WORDS = {
 }
 
 def _extract_device_name_from_text(utterance: str) -> str | None:
-    """
-    Pull a device-ish name from the user's phrase.
-    """
     s = (utterance or "").strip()
     if not s:
         return None
@@ -278,6 +273,37 @@ def handle_command(text: str):
         log_action("open_app", "success" if ok else "failed", target=app)
         if not ok:
             tts.speak(f"I couldn't find or launch {app} on this PC.")
+        return
+
+    # ---------- Site Search ----------
+    if intent.intent == "site.search":
+        slots = intent.slots or {}
+        site  = slots.get("site")
+        query = slots.get("query")
+
+        # Tune behavior if you like:
+        prefer_direct = True   # try direct on-site pattern (e.g., /search?q=)
+        probe = False          # set True to verify which candidate actually works
+
+        try:
+            ok, url = site_search.open_site_search(
+                open_url,
+                site,
+                query,
+                browser_pref=BROWSER,
+                prefer_direct=prefer_direct,
+                probe=probe,
+            )
+            say_site = site or "the web"
+            say_q = f" for {query}" if query else ""
+            tts.speak_blocking(f"Searching {say_site}{say_q}.", timeout=2.0)
+            log_action("site.search", "success" if ok else "failed",
+                       site=site, query=query, target=url)
+            if not ok:
+                tts.speak("I couldn't open the browser.")
+        except Exception as e:
+            log_action("site.search", "error", site=site, query=query, error=str(e))
+            tts.speak("I couldn't perform that search.")
         return
 
     # ---------- Audio ----------
@@ -557,6 +583,7 @@ def handle_command(text: str):
             tts.speak("Connecting to Wi-Fi networks isn't available on this build.")
             log_action("wifi_connect", "not_supported", ssid=ssid)
         return
+
     # ---------- Weather ----------
     if intent.intent == "weather.get":
         slots = intent.slots or {}
@@ -566,6 +593,7 @@ def handle_command(text: str):
         weather_skill.speak_weather_sync(tts, city, when)
         log_action("weather.get", "success", city=city, when=when)
         return
+
     # ---------- Power ----------
     if intent.intent == "power_sleep" and sysctl:
         tts.speak("Going to sleep.")
