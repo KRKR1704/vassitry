@@ -342,9 +342,17 @@ def parse_intent(text: str) -> IntentResult:
         if m:
             city = m.groupdict().get("city") or _extract_city(s)
             when = _detect_when(s)
-            city = (city.strip(" ?.,"))
-            city = city if city else None
-            return IntentResult("weather.get", None, slots={"city": city, "when": when})
+
+            # --- sanitize city: strip artifacts and ignore time words ---
+            if city:
+                city = city.strip(" ?.,'\"")
+                # strip leading "'s " or "s " (from "what's", "how's")
+                city = re.sub(r"^\s*'?s\s+", "", city, flags=re.I)
+                # if city only contains time words, drop it
+                if re.search(r"\b(today|tomorrow|yesterday|now)\b", city, re.I):
+                    city = None
+
+        return IntentResult("weather.get", None, slots={"city": city, "when": when})
 
     # ===== Site search (generic) =====
     # Put BEFORE raw URL detection and before the generic "open" handler.
