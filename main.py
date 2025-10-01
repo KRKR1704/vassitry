@@ -26,7 +26,7 @@ from ultron.skills import weather as weather_skill
 from ultron.skills import site_search
 
 # ---- minimal logging switch ----
-DEBUG = False  # set True while debugging; False to silence startup logs
+DEBUG = True  # set True while debugging; False to silence startup logs
 
 def log_debug(msg: str):
     if DEBUG:
