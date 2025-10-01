@@ -352,7 +352,7 @@ def parse_intent(text: str) -> IntentResult:
                 if re.search(r"\b(today|tomorrow|yesterday|now)\b", city, re.I):
                     city = None
 
-        return IntentResult("weather.get", None, slots={"city": city, "when": when})
+            return IntentResult("weather.get", None, slots={"city": city, "when": when})
 
     # ===== Site search (generic) =====
     # Put BEFORE raw URL detection and before the generic "open" handler.
