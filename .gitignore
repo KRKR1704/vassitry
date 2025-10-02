@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Logs
+logs/
+
+# Add sensitive files to ignore list
+token_calendar.json
+calendar_auth.json
