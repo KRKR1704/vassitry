@@ -782,13 +782,15 @@ def on_wake():
     log_debug("[Ultron] Listening (triggered)…")
     # Audible wake ack (blocking so the user hears it once)
     try:
-        wake_ack(tts, blocking=True)
+        # Use non-blocking voice ack to avoid delaying the mic capture
+        wake_ack(tts, blocking=False)
     except Exception:
         try:
             tts.speak("Ultron is listening.")
         except Exception:
             pass
-    time.sleep(0.10)
+    # small pause to allow OS/device to settle after wake detection
+    time.sleep(0.05)
 
     log_debug("[Ultron] Capturing command...")
     try:
