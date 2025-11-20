@@ -222,7 +222,15 @@ def _extract_site_and_query(text: str) -> tuple[str | None, str | None]:
 
     return None, None
 
-# ===== Intent parsing =====
+# ===== Calendar intent cues =====
+_CAL_VERBS = r"(create|schedule|add|make|put|set)"
+_CAL_OBJECTS = r"(event|meeting|appointment|calendar|reminder)"
+# date/time cues: am/pm time, relative words, weekdays, or month names
+_CAL_TIME = r"\bat\s+\d{1,2}(:\d{2})?\s*(am|pm)\b"
+_CAL_REL = r"\b(today|tomorrow|tonight|this\s+\w+|next\s+\w+)\b"
+_CAL_ON_DAY = r"\bon\s+(mon|tue|tues|weds|wed|thu|thur|thurs|fri|sat|saturday|sun|sunday)\b"
+_CAL_MONTH = r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b"
+
 def parse_intent(text: str) -> IntentResult:
     if not text:
         return IntentResult("unknown", None)
@@ -235,6 +243,21 @@ def parse_intent(text: str) -> IntentResult:
     app = _browser_app_lookup(tl)
     if app:
         return IntentResult("open_app", app)
+
+    # ===== CALENDAR: create event =====
+    # Strong signal: verb + explicit object word
+    if _has(tl, rf"\b{_CAL_VERBS}\b") and _has(tl, rf"\b{_CAL_OBJECTS}\b"):
+        return IntentResult("calendar.create", t)
+
+    # Also allow: add/put .. to/into calendar
+    if _has(tl, r"\b(add|put)\b") and _has(tl, r"\b(to|into)\s+calendar\b"):
+        return IntentResult("calendar.create", t)
+
+    # Soft signal: scheduling verb + clear date/time cue
+    if _has(tl, rf"\b{_CAL_VERBS}\b") and (
+        _has(tl, _CAL_TIME) or _has(tl, _CAL_REL) or _has(tl, _CAL_ON_DAY) or _has(tl, _CAL_MONTH)
+    ):
+        return IntentResult("calendar.create", t)
 
     # ===== Connectivity (Wi-Fi) — must be BEFORE power =====
     if _has(s, r"\b(wi[-\s]?fi|wifi|wireless|wlan)\b"):
@@ -346,16 +369,13 @@ def parse_intent(text: str) -> IntentResult:
             # --- sanitize city: strip artifacts and ignore time words ---
             if city:
                 city = city.strip(" ?.,'\"")
-                # strip leading "'s " or "s " (from "what's", "how's")
                 city = re.sub(r"^\s*'?s\s+", "", city, flags=re.I)
-                # if city only contains time words, drop it
                 if re.search(r"\b(today|tomorrow|yesterday|now)\b", city, re.I):
                     city = None
 
             return IntentResult("weather.get", None, slots={"city": city, "when": when})
 
     # ===== Site search (generic) =====
-    # Put BEFORE raw URL detection and before the generic "open" handler.
     if _has(s, r"\b(search|find)\b"):
         site, query = _extract_site_and_query(s)
         if site or query:
@@ -363,7 +383,6 @@ def parse_intent(text: str) -> IntentResult:
             if site:
                 raw = site.strip().lower()
                 mapped = _site_alias(raw) or _alias_lookup(raw)
-                # Ignore app tokens like "app:whatsapp" for site searching
                 site_mapped = mapped if (mapped and not str(mapped).startswith("app:")) else site
             return IntentResult("site.search", None, slots={"site": site_mapped or site, "query": query})
 
@@ -372,7 +391,6 @@ def parse_intent(text: str) -> IntentResult:
     if m:
         raw = m.group("url")
         target = _normalize_url_or_domain(raw)
-        # Keep 'open_site' even for app tokens; opener should handle "app:*"
         return IntentResult("open_site", target)
 
     # ===== Audio output devices =====
@@ -399,7 +417,30 @@ def parse_intent(text: str) -> IntentResult:
         if app:
             return IntentResult("open_app", app)
 
-        # Known alias (common name)
+        # Check if it's an installed desktop app FIRST (before website aliases)
+        # This allows desktop apps to take priority over web versions
+        obj_lower = obj.lower()
+        
+        # Try to find it in the app scanner cache
+        try:
+            from ultron.skills.app_scanner import get_app_cache
+            from difflib import get_close_matches
+            
+            installed = get_app_cache()
+            
+            # Exact match
+            if obj_lower in installed:
+                return IntentResult("open_app", obj_lower)
+            
+            # Fuzzy match
+            candidates = list(installed.keys())
+            matches = get_close_matches(obj_lower, candidates, n=1, cutoff=0.7)
+            if matches:
+                return IntentResult("open_app", matches[0])
+        except Exception:
+            pass  # If app scanner fails, fall through to website logic
+
+        # Known alias (common name) - NOW checked after installed apps
         alias = _alias_lookup(obj.lower())
         if alias:
             if alias.startswith("app:"):
@@ -412,14 +453,14 @@ def parse_intent(text: str) -> IntentResult:
             raw = m.group("url")
             return IntentResult("open_site", _normalize_url_or_domain(raw))
 
-        # Fallback: try domain canonicalization on the raw token (e.g., "whatsapp", "twitter")
+        # Domain canonicalization on raw token (e.g., "whatsapp", "twitter")
         mapped = _site_alias(obj)
         if mapped:
             if mapped.startswith("app:"):
                 return IntentResult("open_site", mapped)
             return IntentResult("open_site", _normalize_url_or_domain(mapped))
 
-        # Last resort: treat it like a site keyword; opener can decide scheme
-        return IntentResult("open_site", obj)
+        # Last resort: treat as app name (will be handled by app scanner in apps.py)
+        return IntentResult("open_app", obj)
 
     return IntentResult("unknown", None)

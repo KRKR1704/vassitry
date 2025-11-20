@@ -108,24 +108,6 @@ def open_app(app: str) -> bool:
             r"C:\Users\%USERNAME%\AppData\Local\Microsoft\WindowsApps\Spotify.exe"
         ]) or "spotify"])
 
-    if a == "vlc":
-        return _start([_which_any([
-            "vlc",
-            r"C:\Program Files\VideoLAN\VLC\vlc.exe"
-        ]) or "vlc"])
-
-    if a == "discord":
-        return _start([_which_any([
-            "discord",
-            r"C:\Users\%USERNAME%\AppData\Local\Discord\Update.exe",
-            r"C:\Users\%USERNAME%\AppData\Local\Discord\app-*\Discord.exe"
-        ]) or "discord"])
-
-    if a == "slack":
-        return _start([_which_any([
-            "slack",
-            r"C:\Users\%USERNAME%\AppData\Local\slack\slack.exe"
-        ]) or "slack"])
 
     if a == "steam":
         return _start([_which_any([
@@ -144,10 +126,48 @@ def open_app(app: str) -> bool:
             r"C:\Windows\system32\SnippingTool.exe"
         ]) or "snippingtool"])
 
+    # ---- Dynamic Scan (Start Menu) ----
+    # If we haven't returned yet, scan the system for installed apps
+    try:
+        from ultron.skills.app_scanner import get_app_cache
+        from difflib import get_close_matches
+
+        installed = get_app_cache()
+        # installed is { "google chrome": "path/to/lnk", ... }
+        
+        # 1. Exact match
+        if a in installed:
+            return _start_lnk(installed[a])
+
+        # 2. Fuzzy match
+        # keys are already lowercased
+        candidates = list(installed.keys())
+        matches = get_close_matches(a, candidates, n=1, cutoff=0.6)
+        
+        if matches:
+            best_match = matches[0]
+            # Optional: Log or print what we found
+            # print(f"[Ultron] Found installed app: {best_match}")
+            return _start_lnk(installed[best_match])
+
+    except Exception as e:
+        print(f"[Ultron][apps] Scan error: {e}")
+
+
     # ---- Last resort: try to launch the given token directly (PATH) ----
     path_guess = shutil.which(a)
     if path_guess:
         return _start([path_guess])
 
-    # Could add Start Menu .lnk scanning here if needed later.
     return False
+
+def _start_lnk(lnk_path: str) -> bool:
+    """
+    Start a shortcut (.lnk) file or Windows Store app URI using os.startfile (Windows only).
+    Supports both traditional shortcuts and Store app URIs (shell:AppsFolder\...).
+    """
+    try:
+        os.startfile(lnk_path)
+        return True
+    except Exception:
+        return False
