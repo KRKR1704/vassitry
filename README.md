@@ -117,6 +117,22 @@ python -m venv .venv
 pip install -r requirements.txt
 python ultron/main.py
 ```
+
+### Running as a Background Service
+You can set Ultron to run automatically on startup (hidden in the background):
+
+1. **Install**:
+   ```bash
+   python install_service.py
+   ```
+   This creates a shortcut in your Windows Startup folder that launches Ultron silently.
+
+2. **Uninstall**:
+   ```bash
+   python uninstall_service.py
+   ```
+   This removes the startup shortcut.
+
 ## Configuration
 ```bash
 Create a `.env` file in the repo root:

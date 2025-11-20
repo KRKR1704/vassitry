@@ -417,7 +417,30 @@ def parse_intent(text: str) -> IntentResult:
         if app:
             return IntentResult("open_app", app)
 
-        # Known alias (common name)
+        # Check if it's an installed desktop app FIRST (before website aliases)
+        # This allows desktop apps to take priority over web versions
+        obj_lower = obj.lower()
+        
+        # Try to find it in the app scanner cache
+        try:
+            from ultron.skills.app_scanner import get_app_cache
+            from difflib import get_close_matches
+            
+            installed = get_app_cache()
+            
+            # Exact match
+            if obj_lower in installed:
+                return IntentResult("open_app", obj_lower)
+            
+            # Fuzzy match
+            candidates = list(installed.keys())
+            matches = get_close_matches(obj_lower, candidates, n=1, cutoff=0.7)
+            if matches:
+                return IntentResult("open_app", matches[0])
+        except Exception:
+            pass  # If app scanner fails, fall through to website logic
+
+        # Known alias (common name) - NOW checked after installed apps
         alias = _alias_lookup(obj.lower())
         if alias:
             if alias.startswith("app:"):
@@ -437,7 +460,7 @@ def parse_intent(text: str) -> IntentResult:
                 return IntentResult("open_site", mapped)
             return IntentResult("open_site", _normalize_url_or_domain(mapped))
 
-        # Last resort: treat it like a site keyword; opener can decide scheme
-        return IntentResult("open_site", obj)
+        # Last resort: treat as app name (will be handled by app scanner in apps.py)
+        return IntentResult("open_app", obj)
 
     return IntentResult("unknown", None)

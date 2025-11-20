@@ -1,4 +1,28 @@
 # --- load .env *before anything else* so keys are available to all modules ---
+import os
+import sys
+
+# Ensure we are running from the script's directory so relative paths (logs/, .env) work
+if getattr(sys, 'frozen', False):
+    # If bundled (e.g. PyInstaller), use the executable's dir
+    _base_dir = os.path.dirname(sys.executable)
+else:
+    # Normal python script
+    _base_dir = os.path.dirname(os.path.abspath(__file__))
+
+os.chdir(_base_dir)
+
+# --- FIX FOR PYTHONW (Background Service) ---
+# pythonw.exe does not have stdout/stderr, so print() can cause a crash.
+# We redirect them to a log file or devnull.
+if sys.executable.endswith("pythonw.exe"):
+    # Redirect to a log file for debugging startup issues
+    _log_file = os.path.join(_base_dir, "logs", "service_startup.log")
+    os.makedirs(os.path.dirname(_log_file), exist_ok=True)
+    sys.stdout = open(_log_file, "a", encoding="utf-8", buffering=1)
+    sys.stderr = open(_log_file, "a", encoding="utf-8", buffering=1)
+# --------------------------------------------
+
 try:
     from dotenv import load_dotenv  # pip install python-dotenv
     load_dotenv()
@@ -252,8 +276,23 @@ def handle_command(text: str):
     log_event({"type": "asr_result", "text": text, "intent": intent.intent, "entity": intent.entity})
 
     # ---------- Websites / Apps ----------
+    # ---------- Websites / Apps ----------
     if intent.intent == "open_site" and intent.entity:
-        url = _ensure_url(intent.entity)
+        # Heuristic: if it doesn't have a dot (e.g. "notepad", "spotify"), try app first
+        # unless it explicitly starts with http
+        target = intent.entity.strip()
+        is_url = "." in target or target.startswith(("http:", "https:"))
+        
+        if not is_url and open_app:
+            # Try opening as app first
+            print(f"[Ultron] '{target}' looks like an app, trying open_app first...")
+            if open_app(target):
+                tts.speak(f"Opening {target}.")
+                log_action("open_app", "success", target=target, source="open_site_fallback")
+                return
+
+        # Otherwise, treat as site
+        url = _ensure_url(target)
         say = f"Opening {url.replace('https://','').replace('http://','')}"
         print(f"[Ultron] {say}")
         tts.speak_blocking(say, timeout=2.5)
@@ -775,6 +814,13 @@ def main():
     log_debug(f"[Ultron] Starting with trigger mode: {mode or 'hotkey'}")
     log_debug(f"[Ultron] GOOGLE_API_KEY present: {bool(os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY'))}")
     log_event({"type": "boot", "trigger": mode or "hotkey"})
+
+    # ==== Initialize app cache at startup ====
+    try:
+        from ultron.skills.app_scanner import initialize_app_cache
+        initialize_app_cache()
+    except Exception as e:
+        log_debug(f"[Ultron] App cache initialization failed: {e}")
 
     # Startup line (blocking so you hear it once)
     tts.speak_blocking("Ultron is standing by.", timeout=2.5)
