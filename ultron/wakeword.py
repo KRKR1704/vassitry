@@ -53,6 +53,29 @@ class WakeWordEngine:
 
     # ---------- OpenWakeWord ----------
     def _start_openwakeword(self):
+        # Quick runtime checks: OpenWakeWord requires either the tflite runtime
+        # or TensorFlow to run bundled TFLite models. If neither is present,
+        # avoid importing the openwakeword model module (which imports tflite)
+        # and provide a clear diagnostic for the user.
+        has_tflite = False
+        try:
+            import tflite_runtime.interpreter as tflite  # type: ignore
+            has_tflite = True
+        except Exception:
+            try:
+                import tensorflow as tf  # type: ignore
+                has_tflite = True
+            except Exception:
+                has_tflite = False
+
+        if not has_tflite:
+            print("[Ultron][WakeWord][WARN] TFLite runtime not available (tflite-runtime or tensorflow).\n"
+                  "OpenWakeWord cannot load TFLite wake-word models without it.\n"
+                  "Options: install TensorFlow (`python -m pip install tensorflow`) or `tflite-runtime` if a matching wheel exists,\n"
+                  "or set WAKE_ENGINE=hotkey to use the hotkey trigger only.")
+            return
+
+        # Safe to import openwakeword now that tflite/tensorflow is present
         import sounddevice as sd
         from openwakeword.model import Model
         import numpy as np
@@ -124,26 +147,62 @@ class WakeWordEngine:
         kw = (WAKEWORD or "").strip()
         is_custom_model = os.path.isfile(kw) and kw.lower().endswith(".ppn")
 
-        if is_custom_model:
-            porcupine = pvporcupine.create(
-                access_key=PORCUPINE_ACCESS_KEY,
-                keyword_paths=[kw],
-                sensitivities=[0.6],
-            )
-            shown = os.path.basename(kw)
-        else:
-            if kw.lower() not in builtin_keywords:
-                raise ValueError(
-                    f'"{kw}" is not a built-in Porcupine keyword and no .ppn file found.\n'
-                    f'Choose one of: {", ".join(sorted(builtin_keywords))}\n'
-                    f'Or set WAKEWORD to a .ppn file path for your custom keyword.'
+        # Try to create the Porcupine object and provide diagnostics + fallback
+        try:
+            if is_custom_model:
+                porcupine = pvporcupine.create(
+                    access_key=PORCUPINE_ACCESS_KEY,
+                    keyword_paths=[kw],
+                    sensitivities=[0.6],
                 )
-            porcupine = pvporcupine.create(
-                access_key=PORCUPINE_ACCESS_KEY,
-                keywords=[kw.lower()],
-                sensitivities=[0.6],
-            )
-            shown = kw.lower()
+                shown = os.path.basename(kw)
+            else:
+                if kw.lower() not in builtin_keywords:
+                    raise ValueError(
+                        f'"{kw}" is not a built-in Porcupine keyword and no .ppn file found.\n'
+                        f'Choose one of: {", ".join(sorted(builtin_keywords))}\n'
+                        f'Or set WAKEWORD to a .ppn file path for your custom keyword.'
+                    )
+                porcupine = pvporcupine.create(
+                    access_key=PORCUPINE_ACCESS_KEY,
+                    keywords=[kw.lower()],
+                    sensitivities=[0.6],
+                )
+                shown = kw.lower()
+        except Exception as e:
+            # Print helpful diagnostics to the console to aid troubleshooting
+            try:
+                print(f"[Ultron][WakeWord][ERR] Porcupine initialization failed: {e}")
+                # Model file diagnostics
+                if is_custom_model:
+                    try:
+                        st = os.stat(kw)
+                        head = open(kw, 'rb').read(32)
+                        print(f"[Ultron][WakeWord][DBG] model file: {kw} size={st.st_size} head={head[:8]!r}")
+                    except Exception:
+                        print(f"[Ultron][WakeWord][DBG] model file: {kw} (could not read)")
+                else:
+                    print(f"[Ultron][WakeWord][DBG] requested builtin keyword: {kw}")
+                # Access key info (don't print key, only presence/length)
+                try:
+                    print(f"[Ultron][WakeWord][DBG] PORCUPINE_ACCESS_KEY set: {bool(PORCUPINE_ACCESS_KEY)} length={len(PORCUPINE_ACCESS_KEY or '')}")
+                except Exception:
+                    pass
+                try:
+                    print(f"[Ultron][WakeWord][DBG] pvporcupine version: {getattr(pvporcupine, '__version__', 'unknown')}")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            # Attempt to fallback to openwakeword instead of terminating
+            try:
+                print('[Ultron][WakeWord] Falling back to OpenWakeWord due to Porcupine init failure.')
+                # Start openwakeword in its own thread
+                self._start_openwakeword()
+                return
+            except Exception as fallback_exc:
+                raise RuntimeError(f"Porcupine init failed: {e}; fallback to OpenWakeWord failed: {fallback_exc}") from e
 
         pa = pyaudio.PyAudio()
 

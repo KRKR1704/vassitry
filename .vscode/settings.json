@@ -1,3 +1,6 @@
 {
-    "python-envs.pythonProjects": []
+    "python-envs.pythonProjects": [],
+    // Load environment variables from .env into integrated terminals
+    // Requires the Python extension; ensures terminal sessions pick up .env
+    "python.terminal.useEnvFile": true
 }
