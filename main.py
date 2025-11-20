@@ -23,6 +23,24 @@ if sys.executable.endswith("pythonw.exe"):
     sys.stderr = open(_log_file, "a", encoding="utf-8", buffering=1)
 # --------------------------------------------
 
+# --- Single-instance guard (Windows) ---
+# Prevent multiple background launches from competing for the microphone.
+try:
+    if os.name == "nt":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        _mutex_name = "Global\\Ultron_vassitry_singleton"
+        _mutex = kernel32.CreateMutexW(None, ctypes.c_bool(True), _mutex_name)
+        _last_err = kernel32.GetLastError()
+        # ERROR_ALREADY_EXISTS == 183
+        if _last_err == 183:
+            # Another instance is running — exit silently.
+            sys.exit(0)
+except Exception:
+    # If the guard fails for any reason, continue (don't prevent startup)
+    pass
+
+
 try:
     from dotenv import load_dotenv  # pip install python-dotenv
     load_dotenv()
