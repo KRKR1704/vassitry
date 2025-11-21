@@ -77,9 +77,23 @@ except Exception:
 # ---- minimal logging switch ----
 DEBUG = True  # set True while debugging; False to silence startup logs
 
+# UI logging helper (populated if ultron.ui is available)
+_ui_enqueue = None
+try:
+    from ultron import ui as _ultron_ui
+    _ui_enqueue = getattr(_ultron_ui, "enqueue", None)
+except Exception:
+    _ui_enqueue = None
+
+
 def log_debug(msg: str):
     if DEBUG:
         print(msg)
+        try:
+            if _ui_enqueue:
+                _ui_enqueue(f"[DBG] {msg}")
+        except Exception:
+            pass
 
 # --- Optional skills (import defensively) ---
 try:
@@ -116,6 +130,9 @@ tts = TTS()
 # ==== NEW: global cancel flag + helper ========================================
 SPEECH_CANCEL = threading.Event()
 
+# Global shutdown event used by loops
+SHUTDOWN_EVENT = threading.Event()
+
 def stop_speaking():
     """Signal any ongoing TTS to stop ASAP."""
     SPEECH_CANCEL.set()
@@ -141,6 +158,11 @@ def log_event(event: dict):
     os.makedirs(os.path.dirname(LOGS_PATH), exist_ok=True)
     with open(LOGS_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    try:
+        if _ui_enqueue:
+            _ui_enqueue(json.dumps(event, ensure_ascii=False))
+    except Exception:
+        pass
 
 def log_action(name: str, status: str, **fields):
     payload = {"type": "action", "name": name, "status": status}
@@ -838,12 +860,28 @@ def main():
     # ==== Initialize app cache at startup ====
     try:
         from ultron.skills.app_scanner import initialize_app_cache
-        initialize_app_cache()
+        # run app scanner quickly but it may be expensive; run in background thread
+        try:
+            t = threading.Thread(target=initialize_app_cache, daemon=True)
+            t.start()
+        except Exception:
+            initialize_app_cache()
     except Exception as e:
         log_debug(f"[Ultron] App cache initialization failed: {e}")
 
     # Startup line (blocking so you hear it once)
     tts.speak_blocking("Ultron is standing by.", timeout=2.5)
+
+    # Start UI when launched via pythonw (i.e., when run from the VBS launcher)
+    try:
+        if sys.executable.lower().endswith("pythonw.exe"):
+            try:
+                from ultron.ui import start_ui_thread
+                start_ui_thread()
+            except Exception as _e:
+                log_debug(f"[Ultron][UI] Failed to start UI: {_e}")
+    except Exception:
+        pass
 
     # ==== NEW: start a global keyboard listener for ESC cancel ================
     def _kb_on_press(key):
@@ -855,6 +893,33 @@ def main():
     kb_listener.daemon = True
     kb_listener.start()
     # ==========================================================================
+
+    # start a watcher thread that looks for a shutdown.flag file
+    def _shutdown_watcher():
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+            flag = os.path.join(base, "..", "shutdown.flag")
+            flag = os.path.normpath(flag)
+            while not SHUTDOWN_EVENT.is_set():
+                try:
+                    if os.path.exists(flag):
+                        try:
+                            os.remove(flag)
+                        except Exception:
+                            pass
+                        SHUTDOWN_EVENT.set()
+                        break
+                except Exception:
+                    pass
+                time.sleep(1.0)
+        except Exception:
+            pass
+
+    try:
+        watcher = threading.Thread(target=_shutdown_watcher, daemon=True)
+        watcher.start()
+    except Exception:
+        pass
 
     # Common hotkey callback used by hotkey-only and both-modes
     def _on_hotkey():
@@ -882,7 +947,7 @@ def main():
             trigger.start()
             log_debug(f"[Ultron] Registered hotkey {HOTKEY} (press to talk).")
 
-            while True:
+            while not SHUTDOWN_EVENT.is_set():
                 time.sleep(0.5)
 
         elif mode == "both":
@@ -900,7 +965,7 @@ def main():
                 ww = None
 
             log_debug(f"[Ultron] Running both hotkey and wakeword triggers. Press {HOTKEY} or speak the wake word.")
-            while True:
+            while not SHUTDOWN_EVENT.is_set():
                 time.sleep(0.5)
 
         else:
@@ -908,7 +973,7 @@ def main():
             ww = WakeWordEngine(on_wake=on_wake)
             ww.start()
             log_debug("[Ultron] Wakeword listener started.")
-            while True:
+            while not SHUTDOWN_EVENT.is_set():
                 time.sleep(0.5)
 
     except KeyboardInterrupt:
