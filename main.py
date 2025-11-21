@@ -845,6 +845,20 @@ def main():
     # Startup line (blocking so you hear it once)
     tts.speak_blocking("Ultron is standing by.", timeout=2.5)
 
+    # If running under pythonw (VBS launcher), start a small log window so users see activity
+    try:
+        if sys.executable.lower().endswith("pythonw.exe"):
+            try:
+                log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs", "service_startup.log")
+                log_path = os.path.normpath(log_path)
+                from ultron.log_window import start_log_window_thread
+                start_log_window_thread(log_path)
+                log_debug("[Ultron][UI] Log window started for pythonw launcher.")
+            except Exception as _e:
+                log_debug(f"[Ultron][UI] Failed to start log window: {_e}")
+    except Exception:
+        pass
+
     # ==== NEW: start a global keyboard listener for ESC cancel ================
     def _kb_on_press(key):
         if key == keyboard.Key.esc:
