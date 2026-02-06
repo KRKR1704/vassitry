@@ -22,6 +22,10 @@ BROWSER = os.getenv("BROWSER", "default").lower()
 # Examples: "ctrl+alt+u", "win+shift+space", "ctrl+shift+enter"
 HOTKEY = os.getenv("ULTRON_HOTKEY", "alt+u")
 
+# Optional separate command hotkey (for system commands like minimize)
+# Example: set ULTRON_HOTKEY_MINIMIZE=alt+m
+HOTKEY_MINIMIZE = os.getenv("ULTRON_HOTKEY_MINIMIZE", "alt+m")
+
 # Microphone: None = system default
 MIC_INDEX = None
 

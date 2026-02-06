@@ -20,12 +20,133 @@ Behavior:
 
 import re
 from typing import Iterable
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse, quote_plus, urljoin
 
 try:
-    import requests  # optional; only used if probe=True
+    import requests  # optional; only used if probe=True and discovery
 except Exception:
     requests = None
+
+# Optional BeautifulSoup for static discovery
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+except Exception:
+    BeautifulSoup = None
+
+# Simple in-memory cache for discovered search templates: host -> template or None
+_DISCOVERY_CACHE: dict[str, str | None] = {}
+
+
+def _discover_search_template_bs4(host: str, timeout: float = 2.0) -> str | None:
+    """Try to discover a search URL template from a site's static HTML using BeautifulSoup.
+    Returns a template with a single `{q}` placeholder (already quoted), or None on failure.
+    """
+    if requests is None or BeautifulSoup is None:
+        return None
+    base = f"https://{host}"
+    try:
+        r = requests.get(base, timeout=timeout, headers={"User-Agent": "UltronSiteSearch/1.0"})
+        r.raise_for_status()
+        text = r.text
+    except Exception:
+        return None
+
+    soup = BeautifulSoup(text, "html.parser")
+
+    # 1) Look for reasonable <form> elements
+    for form in soup.find_all("form"):
+        action = form.get("action") or ""
+        action_url = urljoin(base, action)
+        q_input = None
+        for inp in form.find_all("input"):
+            nm = (inp.get("name") or "").lower()
+            t = (inp.get("type") or "").lower()
+            if nm in ("q", "query", "s", "search", "k") or t == "search":
+                q_input = nm or "q"
+                break
+        if q_input:
+            sep = "&" if "?" in action_url else "?"
+            return f"{action_url}{sep}{q_input}={{q}}"
+
+    # 2) Heuristic: links with 'search' or '/results' in href
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "search" in href.lower() or "/results" in href.lower():
+            candidate = urljoin(base, href)
+            # If params already present try to pick a param name, else append ?q=
+            m = re.search(r"[?&]([^=]+)=", candidate)
+            if m:
+                param = m.group(1)
+                base_only = candidate.split("?")[0]
+                return f"{base_only}?{param}={{q}}"
+            sep = "&" if "?" in candidate else "?"
+            return f"{candidate}{sep}q={{q}}"
+
+    return None
+
+
+def discover_search_template(host: str, timeout: float = 2.0, use_selenium: bool = False) -> str | None:
+    """Public discovery entry. Uses BeautifulSoup first; optional Selenium fallback when requested.
+    Caches results in `_DISCOVERY_CACHE`.
+    """
+    if host in _DISCOVERY_CACHE:
+        return _DISCOVERY_CACHE[host]
+
+    tpl = _discover_search_template_bs4(host, timeout=timeout)
+    if tpl:
+        _DISCOVERY_CACHE[host] = tpl
+        return tpl
+
+    # Optional Selenium fallback for JS-heavy sites
+    if use_selenium:
+        try:
+            # Lazy imports to avoid requiring Selenium at import time
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options
+            from webdriver_manager.chrome import ChromeDriverManager
+        except Exception:
+            _DISCOVERY_CACHE[host] = None
+            return None
+
+        options = Options()
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        try:
+            drv = webdriver.Chrome(ChromeDriverManager().install(), options=options)
+            base = f"https://{host}"
+            drv.set_page_load_timeout(timeout)
+            drv.get(base)
+            html = drv.page_source
+            drv.quit()
+            # Parse with BeautifulSoup if available
+            if BeautifulSoup is not None:
+                soup = BeautifulSoup(html, "html.parser")
+                # reuse bs4 discovery logic by mocking request text
+                # simple approach: write to temporary variable and parse
+                for form in soup.find_all("form"):
+                    action = form.get("action") or ""
+                    action_url = urljoin(base, action)
+                    q_input = None
+                    for inp in form.find_all("input"):
+                        nm = (inp.get("name") or "").lower()
+                        t = (inp.get("type") or "").lower()
+                        if nm in ("q", "query", "s", "search", "k") or t == "search":
+                            q_input = nm or "q"
+                            break
+                    if q_input:
+                        sep = "&" if "?" in action_url else "?"
+                        tpl = f"{action_url}{sep}{q_input}={{q}}"
+                        _DISCOVERY_CACHE[host] = tpl
+                        return tpl
+        except Exception:
+            try:
+                drv.quit()
+            except Exception:
+                pass
+
+    _DISCOVERY_CACHE[host] = None
+    return None
 
 
 # Known, reliable search paths for popular sites.

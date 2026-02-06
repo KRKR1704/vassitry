@@ -11,6 +11,7 @@ else:
     _base_dir = os.path.dirname(os.path.abspath(__file__))
 
 os.chdir(_base_dir)
+print(">>> main.py started")
 
 # --- FIX FOR PYTHONW (Background Service) ---
 # pythonw.exe does not have stdout/stderr, so print() can cause a crash.
@@ -34,8 +35,14 @@ try:
         _last_err = kernel32.GetLastError()
         # ERROR_ALREADY_EXISTS == 183
         if _last_err == 183:
-            # Another instance is running — exit silently.
-            sys.exit(0)
+            # Another instance is running. In normal use we exit silently to
+            # avoid multiple background services competing for the mic. For
+            # development, allow an override via ULTRON_DEV so you can launch
+            # a second instance for UI testing.
+            if not os.getenv("ULTRON_DEV"):
+                sys.exit(0)
+            else:
+                print("[Ultron][DEV] Another instance detected — continuing because ULTRON_DEV=1")
 except Exception:
     # If the guard fails for any reason, continue (don't prevent startup)
     pass
@@ -55,10 +62,11 @@ import platform
 import ctypes
 import threading
 from datetime import datetime, UTC
+import traceback
 
 from pynput import keyboard
 
-from ultron.config import LOGS_PATH, BROWSER, WAKE_ENGINE, HOTKEY
+from ultron.config import LOGS_PATH, BROWSER, WAKE_ENGINE, HOTKEY, HOTKEY_MINIMIZE
 from ultron.wakeword import WakeWordEngine
 from ultron.listener import Listener
 from ultron.tts import TTS
@@ -135,6 +143,9 @@ listener = Listener(
     non_speaking_duration=0.30, # tolerate tiny gaps
     phrase_time_limit=15        # more time to speak
 )
+
+# Global UI handle (set when UI created) so wake callbacks can route to UI when present
+MAIN_WINDOW = None
 
 def log_event(event: dict):
     event["ts"] = datetime.now(UTC).isoformat()
@@ -283,6 +294,8 @@ _HOTKEY_REQS = _parse_hotkey_to_requirements(HOTKEY)
 _LAST_HOTKEY_TS = 0.0
 _HOTKEY_LOCK = threading.Lock()
 _HOTKEY_COOLDOWN_SEC = 1.25
+# Global microphone lock to prevent concurrent listeners
+MIC_LOCK = threading.Lock()
 # ===================== End Hotkey Guard =====================
 
 def _speak_ok_fail(ok: bool, ok_msg: str, fail_msg: str):
@@ -293,7 +306,6 @@ def handle_command(text: str):
     print(f"[Ultron] Intent={intent.intent} entity={intent.entity}")
     log_event({"type": "asr_result", "text": text, "intent": intent.intent, "entity": intent.entity})
 
-    # ---------- Websites / Apps ----------
     # ---------- Websites / Apps ----------
     if intent.intent == "open_site" and intent.entity:
         # Heuristic: if it doesn't have a dot (e.g. "notepad", "spotify"), try app first
@@ -801,31 +813,68 @@ def on_wake():
     # Audible wake ack (blocking so the user hears it once)
     try:
         # Use non-blocking voice ack to avoid delaying the mic capture
-        wake_ack(tts, blocking=False)
+        wake_ack(tts, blocking=True)
     except Exception:
         try:
             tts.speak("Ultron is listening.")
         except Exception:
             pass
     # small pause to allow OS/device to settle after wake detection
-    time.sleep(0.05)
+    # Increase to 0.15s on Windows to avoid TTS blocking mic capture
+    time.sleep(0.15)
 
-    log_debug("[Ultron] Capturing command...")
+    # Try to acquire mic lock so we don't have concurrent captures
     try:
-        cmd = listener.listen_once(timeout=10, phrase_time_limit=15)
-    except Exception as e:
-        print(f"[Ultron] Listener error: {e}")
-        log_event({"type": "listen_error", "error": str(e)})
-        tts.speak("I had trouble hearing you.")
-        return
+        if not MIC_LOCK.acquire(blocking=False):
+            log_debug("[Ultron] Mic busy, ignoring wake")
+            return
+    except Exception:
+        # If lock acquisition fails unexpectedly, continue cautiously
+        pass
+    try:
+        log_debug("[Ultron] Capturing command...")
+        try:
+            cmd = listener.listen_once(timeout=10, phrase_time_limit=15)
+        except Exception as e:
+            print(f"[Ultron] Listener error: {e}")
+            log_event({"type": "listen_error", "error": str(e)})
+            try:
+                tts.speak("I had trouble hearing you.")
+            except Exception:
+                pass
+            return
 
-    if not cmd:
-        tts.speak("I didn't hear anything.")
-        log_event({"type": "listen_timeout"})
-        return
+        if not cmd:
+            try:
+                tts.speak("I didn't hear anything.")
+            except Exception:
+                pass
+            log_event({"type": "listen_timeout"})
+            return
 
-    log_debug(f"[Ultron] Heard: {cmd}")
-    handle_command(cmd)
+        log_debug(f"[Ultron] Heard: {cmd}")
+    finally:
+        try:
+            MIC_LOCK.release()
+        except Exception:
+            pass
+    # ALWAYS execute command centrally first so runtime actions occur
+    try:
+        handle_command(cmd)
+    except Exception as _e:
+        print("[Ultron][ERR] handle_command failed:", _e)
+        traceback.print_exc()
+
+    # THEN notify UI (optional, non-blocking cosmetic update)
+    try:
+        if MAIN_WINDOW is not None:
+            try:
+                print("[UI] voice received:", cmd)
+                MAIN_WINDOW.on_voice_recognized(cmd)
+            except Exception as _e:
+                print("UI notify failed:", _e)
+    except Exception:
+        pass
 
 def main():
     os.makedirs("logs", exist_ok=True)
@@ -842,57 +891,259 @@ def main():
     except Exception as e:
         log_debug(f"[Ultron] App cache initialization failed: {e}")
 
-    # Startup line (blocking so you hear it once)
-    tts.speak_blocking("Ultron is standing by.", timeout=2.5)
-
-    # If running under pythonw (VBS launcher), start a small log window so users see activity
+    # --- Start the Qt UI on the main thread BEFORE any blocking services ---
     try:
-        if sys.executable.lower().endswith("pythonw.exe"):
+        from PySide6.QtWidgets import QApplication
+        from ultron.ui.state import UIStateManager
+        from ultron.ui.main_window import MainWindow
+
+        app = QApplication(sys.argv)
+        print("[Ultron][UI DEBUG] QApplication created")
+        sm = UIStateManager()
+        # Pass central command executor so UI input always reaches runtime
+        win = MainWindow(state_manager=sm, command_executor=handle_command)
+        print("[Ultron][UI DEBUG] MainWindow instance created")
+        win.show()
+        print("[Ultron][UI DEBUG] MainWindow.show() called")
+        try:
+            # Try to bring the window to the foreground in case it's off-screen or minimized
+            from PySide6.QtCore import Qt
             try:
-                log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs", "service_startup.log")
-                log_path = os.path.normpath(log_path)
-                from ultron.log_window import start_log_window_thread
-                start_log_window_thread(log_path)
-                log_debug("[Ultron][UI] Log window started for pythonw launcher.")
+                win.raise_()
+            except Exception:
+                pass
+            try:
+                win.activateWindow()
+            except Exception:
+                pass
+            try:
+                win.setWindowState((win.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+            except Exception:
+                pass
+            print("[Ultron][UI DEBUG] Attempted to activate MainWindow (raise/activate)")
+        except Exception:
+            pass
+
+        # expose global handle for on_wake routing
+        global MAIN_WINDOW
+        MAIN_WINDOW = win
+    except Exception as e:
+        print("Failed to start UI:", e)
+        traceback.print_exc()
+        # continue headless
+
+    # Run background services (wakeword, hotkey, TTS startup) in a daemon thread
+    def _run_triggers():
+        # Startup line (blocking so you hear it once) — run in background
+        try:
+            tts.speak_blocking("Ultron is standing by.", timeout=2.5)
+        except Exception:
+            pass
+
+        # If running under pythonw (VBS launcher), start a small log window so users see activity
+        try:
+            if sys.executable.lower().endswith("pythonw.exe"):
+                try:
+                    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs", "service_startup.log")
+                    log_path = os.path.normpath(log_path)
+                    from ultron.log_window import start_log_window_thread
+                    start_log_window_thread(log_path)
+                    log_debug("[Ultron][UI] Log window started for pythonw launcher.")
+                except Exception as _e:
+                    log_debug(f"[Ultron][UI] Failed to start log window: {_e}")
+        except Exception:
+            pass
+
+        # ==== NEW: start a global keyboard listener for ESC cancel ================
+        def _kb_on_press(key):
+            if key == keyboard.Key.esc:
+                log_debug("[Ultron][TTS] ESC pressed → cancel speech")
+                stop_speaking()
+
+        kb_listener = keyboard.Listener(on_press=_kb_on_press)
+        kb_listener.daemon = True
+        kb_listener.start()
+        # ========================================================================
+
+        # Common hotkey callback used by hotkey-only and both-modes
+        def _on_hotkey():
+            # Strict hotkey guard: cooldown + physical key confirmation
+            global _LAST_HOTKEY_TS
+            with _HOTKEY_LOCK:
+                now = time.time()
+                if (now - _LAST_HOTKEY_TS) < _HOTKEY_COOLDOWN_SEC:
+                    log_event({"type": "hotkey_ignored", "reason": "cooldown"})
+                    return
+                if not _hotkey_confirm_pressed(_HOTKEY_REQS, samples=3, interval_ms=50):
+                    log_event({"type": "hotkey_ignored", "reason": "not_confirmed"})
+                    return
+                _LAST_HOTKEY_TS = now
+
+            log_event({"type": "hotkey_trigger", "combo": HOTKEY})
+            on_wake()
+
+        trigger = None
+        cmd_trigger = None
+        ww = None
+
+        try:
+            if mode == "hotkey":
+                trigger = HotkeyEngine(HOTKEY, _on_hotkey)
+                trigger.start()
+                log_debug(f"[Ultron] Registered hotkey {HOTKEY} (press to talk).")
+
+                # Register separate command hotkey if configured and different
+                try:
+                    if HOTKEY_MINIMIZE and HOTKEY_MINIMIZE != HOTKEY:
+                        def _on_minimize_hotkey():
+                            try:
+                                if MAIN_WINDOW and hasattr(MAIN_WINDOW, 'input_router') and MAIN_WINDOW.input_router:
+                                    MAIN_WINDOW.input_router.submit_text("minimize window", echo=True)
+                                    return
+                            except Exception:
+                                pass
+                            # Fallback for headless: directly handle command
+                            try:
+                                handle_command("minimize window")
+                            except Exception:
+                                pass
+
+                        cmd_trigger = HotkeyEngine(HOTKEY_MINIMIZE, _on_minimize_hotkey)
+                        cmd_trigger.start()
+                        log_debug(f"[Ultron] Registered command hotkey {HOTKEY_MINIMIZE} (minimize).")
+                except Exception as _e:
+                    print("Failed to register command hotkey:", _e)
+
+                while True:
+                    time.sleep(0.5)
+
+            elif mode == "both":
+                trigger = HotkeyEngine(HOTKEY, _on_hotkey)
+                try:
+                    trigger.start()
+                except Exception:
+                    trigger = None
+
+                # Register separate command hotkey if configured and different
+                try:
+                    if HOTKEY_MINIMIZE and HOTKEY_MINIMIZE != HOTKEY:
+                        def _on_minimize_hotkey():
+                            try:
+                                if MAIN_WINDOW and hasattr(MAIN_WINDOW, 'input_router') and MAIN_WINDOW.input_router:
+                                    MAIN_WINDOW.input_router.submit_text("minimize window", echo=True)
+                                    return
+                            except Exception:
+                                pass
+                            try:
+                                handle_command("minimize window")
+                            except Exception:
+                                pass
+
+                        cmd_trigger = HotkeyEngine(HOTKEY_MINIMIZE, _on_minimize_hotkey)
+                        cmd_trigger.start()
+                        log_debug(f"[Ultron] Registered command hotkey {HOTKEY_MINIMIZE} (minimize).")
+                except Exception as _e:
+                    print("Failed to register command hotkey:", _e)
+
+                ww = WakeWordEngine(on_wake=on_wake)
+                try:
+                    ww.start()
+                except Exception as e:
+                    print(f"[Ultron][WakeWord] Failed to start wakeword engine: {e}")
+                    ww = None
+
+                log_debug(f"[Ultron] Running both hotkey and wakeword triggers. Press {HOTKEY} or speak the wake word.")
+                while True:
+                    time.sleep(0.5)
+
+            else:
+                # Default wakeword path (openwakeword or porcupine based on WAKE_ENGINE)
+                # Register command hotkey even in default wakeword mode
+                try:
+                    if HOTKEY_MINIMIZE and HOTKEY_MINIMIZE != HOTKEY:
+                        def _on_minimize_hotkey():
+                            try:
+                                if MAIN_WINDOW and hasattr(MAIN_WINDOW, 'input_router') and MAIN_WINDOW.input_router:
+                                    MAIN_WINDOW.input_router.submit_text("minimize window", echo=True)
+                                    return
+                            except Exception:
+                                pass
+                            try:
+                                handle_command("minimize window")
+                            except Exception:
+                                pass
+
+                        cmd_trigger = HotkeyEngine(HOTKEY_MINIMIZE, _on_minimize_hotkey)
+                        cmd_trigger.start()
+                        log_debug(f"[Ultron] Registered command hotkey {HOTKEY_MINIMIZE} (minimize).")
+                except Exception as _e:
+                    print("Failed to register command hotkey:", _e)
+
+                ww = WakeWordEngine(on_wake=on_wake)
+                ww.start()
+                log_debug("[Ultron] Wakeword listener started.")
+                while True:
+                    time.sleep(0.5)
+
+        except KeyboardInterrupt:
+            log_debug("\n[Ultron] Shutting down...")
+        finally:
+            # Stop trigger if started
+            try:
+                if trigger:
+                    trigger.stop()
+            except Exception:
+                pass
+                try:
+                    if trigger:
+                        trigger.stop()
+                except Exception:
+                    pass
+                try:
+                    if cmd_trigger:
+                        cmd_trigger.stop()
+                except Exception:
+                    pass
+                try:
+                    if ww:
+                        ww.stop()
+                except Exception:
+                    pass
+            try:
+                tts.shutdown(timeout=3.0)
+            except Exception:
+                pass
+            log_event({"type": "shutdown"})
+
+    print("[Ultron][UI DEBUG] Starting background services thread")
+    # start background thread
+    try:
+        t = threading.Thread(target=_run_triggers, daemon=True)
+        t.start()
+    except Exception as e:
+        print("Failed to start background triggers thread:", e)
+
+    # Hand control to Qt event loop (if available)
+    try:
+        # If we created a QApplication above, enter its loop; otherwise run legacy blocking path
+        if 'app' in locals():
+            print("[Ultron][UI DEBUG] Entering Qt event loop (app.exec())")
+            try:
+                rc = app.exec()
+                print("[Ultron][UI DEBUG] Qt event loop exited, rc=", rc)
+                sys.exit(rc)
             except Exception as _e:
-                log_debug(f"[Ultron][UI] Failed to start log window: {_e}")
+                print("[Ultron][UI DEBUG] app.exec() raised:", _e)
+                traceback.print_exc()
     except Exception:
-        pass
+        traceback.print_exc()
 
-    # ==== NEW: start a global keyboard listener for ESC cancel ================
-    def _kb_on_press(key):
-        if key == keyboard.Key.esc:
-            log_debug("[Ultron][TTS] ESC pressed → cancel speech")
-            stop_speaking()
-
-    kb_listener = keyboard.Listener(on_press=_kb_on_press)
-    kb_listener.daemon = True
-    kb_listener.start()
-    # ==========================================================================
-
-    # Common hotkey callback used by hotkey-only and both-modes
-    def _on_hotkey():
-        # Strict hotkey guard: cooldown + physical key confirmation
-        global _LAST_HOTKEY_TS
-        with _HOTKEY_LOCK:
-            now = time.time()
-            if (now - _LAST_HOTKEY_TS) < _HOTKEY_COOLDOWN_SEC:
-                log_event({"type": "hotkey_ignored", "reason": "cooldown"})
-                return
-            if not _hotkey_confirm_pressed(_HOTKEY_REQS, samples=3, interval_ms=50):
-                log_event({"type": "hotkey_ignored", "reason": "not_confirmed"})
-                return
-            _LAST_HOTKEY_TS = now
-
-        log_event({"type": "hotkey_trigger", "combo": HOTKEY})
-        on_wake()
-
+    # Legacy fallback: if no UI, run the previous blocking loop behavior
     trigger = None
     ww = None
-
     try:
         if mode == "hotkey":
-            trigger = HotkeyEngine(HOTKEY, _on_hotkey)
+            trigger = HotkeyEngine(HOTKEY, lambda: on_wake())
             trigger.start()
             log_debug(f"[Ultron] Registered hotkey {HOTKEY} (press to talk).")
 
@@ -900,7 +1151,7 @@ def main():
                 time.sleep(0.5)
 
         elif mode == "both":
-            trigger = HotkeyEngine(HOTKEY, _on_hotkey)
+            trigger = HotkeyEngine(HOTKEY, lambda: on_wake())
             try:
                 trigger.start()
             except Exception:
@@ -918,7 +1169,6 @@ def main():
                 time.sleep(0.5)
 
         else:
-            # Default wakeword path (openwakeword or porcupine based on WAKE_ENGINE)
             ww = WakeWordEngine(on_wake=on_wake)
             ww.start()
             log_debug("[Ultron] Wakeword listener started.")
@@ -928,7 +1178,6 @@ def main():
     except KeyboardInterrupt:
         log_debug("\n[Ultron] Shutting down...")
     finally:
-        # Stop trigger if started
         try:
             if trigger:
                 trigger.stop()
@@ -940,14 +1189,15 @@ def main():
         except Exception:
             pass
 
-        # Stop keyboard listener cleanly
         try:
             kb_listener.stop()
         except Exception:
             pass
 
-        # Common shutdown tasks
-        tts.speak_blocking("Ultron shutting down.", timeout=3.0)
+        try:
+            tts.speak_blocking("Ultron shutting down.", timeout=3.0)
+        except Exception:
+            pass
         try:
             tts.shutdown(timeout=3.0)
         except Exception:

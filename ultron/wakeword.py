@@ -98,9 +98,10 @@ class WakeWordEngine:
                 if detected:
                     time.sleep(0.50)  # give OS time to release device
                     try:
+                        print("[Ultron][WakeWord] Detected by OpenWakeWord — calling on_wake()")
                         self.on_wake()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"[Ultron][WakeWord] on_wake() raised: {e}")
                     # loop to reopen stream & continue listening
 
         self._thread = threading.Thread(target=runner, daemon=True)
@@ -178,9 +179,10 @@ class WakeWordEngine:
                         time.sleep(0.50)  # let Windows release the device
 
                         try:
+                            print(f"[Ultron][WakeWord] Porcupine detected keyword (result={result}) — calling on_wake()")
                             self.on_wake()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            print(f"[Ultron][WakeWord] on_wake() raised: {e}")
 
                         if self._stop.is_set():
                             break

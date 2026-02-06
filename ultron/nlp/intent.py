@@ -14,21 +14,11 @@ class IntentResult:
 # NOTE: "whatsapp" is mapped to a special token for the DESKTOP app.
 # If you prefer web, change "app:whatsapp" to "web.whatsapp.com".
 COMMON_MAP = {
+    # Keep only a very small set of explicit aliases. Most spoken site names
+    # should be resolved via `site_search.discover_search_template()` using
+    # BeautifulSoup/Selenium discovery rather than hardcoded mappings.
     "google": "google.com",
-    "gmail": "mail.google.com",
-    "youtube": "youtube.com",
-    "you tube": "youtube.com",
-    "chatgpt": "chat.openai.com",
-    "linkedin": "linkedin.com",
-    "outlook": "outlook.live.com",
     "whatsapp": "app:whatsapp",  # desktop app preference
-    "canvas": "canvas.ubuffalo.edu",
-    "ublearns": "ublearns.buffalo.edu",
-    "reddit": "reddit.com",
-    "twitter": "x.com",
-    "x": "x.com",
-    "stackoverflow": "stackoverflow.com",
-    "stack overflow": "stackoverflow.com",
 }
 
 # --- Browser/app aliases (spoken names -> app id) ---
@@ -244,6 +234,12 @@ def parse_intent(text: str) -> IntentResult:
     if app:
         return IntentResult("open_app", app)
 
+    # Quick: bare 'unmute' or 'mute' should map to volume controls
+    if _has(tl, r"\b(unmute)\b"):
+        return IntentResult("volume_unmute", None)
+    if _has(tl, r"\b(mute)\b") and not _has(tl, r"\b(mute (?:the )?screen|mute (?:notifications|alerts))\b"):
+        return IntentResult("volume_mute", None)
+
     # ===== CALENDAR: create event =====
     # Strong signal: verb + explicit object word
     if _has(tl, rf"\b{_CAL_VERBS}\b") and _has(tl, rf"\b{_CAL_OBJECTS}\b"):
@@ -275,6 +271,12 @@ def parse_intent(text: str) -> IntentResult:
         m = re.search(r"\b(?:connect|join)\s+(?:to\s+)?(?:network\s+)?([^\.,;]+)$", s, re.I)
         if m:
             return IntentResult("wifi_connect", m.group(1).strip())
+
+    # Generic: quoted SSID or explicit connect/join without the word 'wifi'
+    # e.g. "connect to 'MyNetwork'" should be treated as wifi_connect
+    q_ssid = _extract_quoted(s)
+    if q_ssid and re.search(r"\b(connect|join)\b", s, re.I):
+        return IntentResult("wifi_connect", q_ssid)
 
     # ===== Display projection =====
     if _has(s, r"\b(extend|duplicate|mirror|second\s+screen\s+only|pc\s+screen\s+only|project|projection)\b"):
@@ -414,8 +416,16 @@ def parse_intent(text: str) -> IntentResult:
 
         # Browser app?
         app = _browser_app_lookup(obj.lower())
+
+        obj_lower = obj.lower()
         if app:
             return IntentResult("open_app", app)
+
+        # If the user explicitly used the verb 'launch', prefer opening an app
+        # rather than attempting to resolve a website. This helps phrases
+        # like "launch spotify" map to desktop apps by default.
+        if re.search(r"\blaunch\b", s, re.I):
+            return IntentResult("open_app", obj_lower)
 
         # Check if it's an installed desktop app FIRST (before website aliases)
         # This allows desktop apps to take priority over web versions
@@ -460,7 +470,84 @@ def parse_intent(text: str) -> IntentResult:
                 return IntentResult("open_site", mapped)
             return IntentResult("open_site", _normalize_url_or_domain(mapped))
 
-        # Last resort: treat as app name (will be handled by app scanner in apps.py)
-        return IntentResult("open_app", obj)
+        # Last resort: prefer website resolution for ambiguous names, but
+        # treat explicit executable paths as apps. This avoids searching the
+        # filesystem for simple tokens like 'njit' and instead opens the
+        # corresponding site when appropriate.
+        try:
+            import os
+        except Exception:
+            os = None
+
+        raw_obj = (obj or "").strip()
+
+        # Heuristics that indicate a path/executable:
+        # - explicit Windows drive path (C:\...) or UNC \\server\
+        # - contains path separators or looks like an absolute path
+        # - ends with a common executable suffix like .exe
+        looks_like_exe = False
+        if raw_obj:
+            if re.search(r"^[a-zA-Z]:\\\\|^\\\\\\\\", raw_obj):
+                looks_like_exe = True
+            if raw_obj.lower().endswith(".exe"):
+                looks_like_exe = True
+            if os and (os.path.isabs(raw_obj) or ("/" in raw_obj) or ("\\\\" in raw_obj)):
+                looks_like_exe = True
+
+        if looks_like_exe:
+            return IntentResult("open_app", raw_obj)
+
+        # If the token already contains a dot, treat it as a URL/domain and open directly
+        if "." in raw_obj:
+            return IntentResult("open_site", _normalize_url_or_domain(raw_obj))
+
+        # Otherwise try smart domain guesses by appending common TLDs and probing.
+        # Prefer a lightweight probe helper from site_search if available.
+        host_candidate = re.sub(r"[^a-z0-9\-]", "", raw_obj.lower())
+        tlds = [
+            "com", "org", "net", "edu", "io", "gov", "co", "us", "uk",
+            "de", "jp", "fr", "info", "biz", "online", "site", "tech",
+            "ai", "app", "dev", "store", "cloud",
+        ]
+        candidates = [f"https://{host_candidate}.{t}" for t in tlds]
+
+        found = None
+        try:
+            # Try using the site's probe helper if present (uses requests and heuristics).
+            from ultron.skills import site_search as _ss
+            try:
+                found = _ss._probe_first_working(candidates)
+            except Exception:
+                found = None
+        except Exception:
+            found = None
+
+        # If probe helper not available, try requests directly
+        if found is None:
+            try:
+                import requests
+                headers = {"User-Agent": "UltronSiteSearch/1.0"}
+                for url in candidates:
+                    try:
+                        r = requests.head(url, allow_redirects=True, timeout=2.0, headers=headers)
+                        if r.status_code in (200, 301, 302, 303):
+                            found = getattr(r, "url", url)
+                            break
+                        r = requests.get(url, allow_redirects=True, timeout=2.0, headers=headers)
+                        if r.status_code in (200, 301, 302, 303):
+                            found = getattr(r, "url", url)
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                found = None
+
+        if found:
+            return IntentResult("open_site", found)
+
+        # Final fallback: perform a Google 'site:' search for the host so the
+        # user gets relevant results; this can be enhanced later to invoke
+        # BS4/Selenium discovery explicitly if desired.
+        return IntentResult("open_site", f"https://www.google.com/search?q=site%3A{host_candidate}")
 
     return IntentResult("unknown", None)
