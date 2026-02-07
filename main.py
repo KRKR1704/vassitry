@@ -70,6 +70,7 @@ from ultron.config import LOGS_PATH, BROWSER, WAKE_ENGINE, HOTKEY, HOTKEY_MINIMI
 from ultron.wakeword import WakeWordEngine
 from ultron.listener import Listener
 from ultron.tts import TTS
+from ultron.ui.state import UltronMode
 from ultron.nlp.intent import parse_intent
 from ultron.skills.browser import open_url
 from ultron.skills import weather as weather_skill
@@ -121,6 +122,20 @@ _user32 = ctypes.windll.user32 if IS_WINDOWS else None
 
 tts = TTS()
 
+# Register a callback so the UI shows SPEAKING only when audio actually starts.
+def _tts_on_start():
+    try:
+        from PySide6.QtCore import QTimer
+        if MAIN_WINDOW and getattr(MAIN_WINDOW, 'state_manager', None):
+            QTimer.singleShot(0, lambda: MAIN_WINDOW.state_manager.set_mode(UltronMode.SPEAKING))
+    except Exception:
+        pass
+
+try:
+    tts.set_on_start(_tts_on_start)
+except Exception:
+    pass
+
 # ==== NEW: global cancel flag + helper ========================================
 SPEECH_CANCEL = threading.Event()
 
@@ -130,6 +145,17 @@ def stop_speaking():
     try:
         if hasattr(tts, "stop"):
             tts.stop()
+    except Exception:
+        pass
+# Optional subtle wake beep (Windows-only)
+def play_wake_sound():
+    try:
+        import platform
+        if platform.system() != "Windows":
+            return
+        import winsound
+        # short, subtle beep (freq, duration_ms)
+        winsound.Beep(880, 60)
     except Exception:
         pass
 # ==============================================================================
@@ -146,6 +172,39 @@ listener = Listener(
 
 # Global UI handle (set when UI created) so wake callbacks can route to UI when present
 MAIN_WINDOW = None
+
+
+def ui_say(text: str):
+    """Single UI output pipe: show Ultron messages in the UI when available."""
+    if not text:
+        return
+
+    if MAIN_WINDOW is None:
+        print("[UI ERROR] MAIN_WINDOW is None, cannot show:", text)
+        return
+
+    try:
+        # This MUST be the single entry point for Ultron replies
+        MAIN_WINDOW.add_message(text, is_user=False)
+    except Exception as e:
+        print("[UI ERROR] ui_say failed:", e)
+
+
+def ultron_reply(text: str, *, speak: bool = True):
+    # UI first
+    try:
+        ui_say(text)
+    except Exception:
+        pass
+
+    if not speak:
+        return
+
+    # Use speak_text (which handles queuing and sets IDLE after flush)
+    try:
+        speak_text(text)
+    except Exception:
+        pass
 
 def log_event(event: dict):
     event["ts"] = datetime.now(UTC).isoformat()
@@ -184,31 +243,95 @@ def _speak_chunks(text: str, chunk_size: int = 350):
         return
 
     text = text.strip()
-    if len(text) <= chunk_size:
-        try:
-            tts.speak(text)
-        except Exception:
-            pass
-        return
+    # Prefer sentence-by-sentence speaking to feel more responsive.
+    try:
+        import re as _re
+        sentences = [s.strip() for s in _re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+    except Exception:
+        sentences = [text]
 
-    buf = []
-    for token in text.replace("\n", " ").split(" "):
+    for s in sentences:
         if SPEECH_CANCEL.is_set():
             break
-        if sum(len(x) for x in buf) + len(buf) + len(token) > chunk_size:
+        # If sentence is short enough, speak it whole; otherwise chunk by words
+        if len(s) <= chunk_size:
             try:
-                tts.speak(" ".join(buf))
+                try:
+                    ts = time.time()
+                    print(f"[TTS-INSTR][LLM] emit ts={ts:.3f} text='{s[:40]}'")
+                except Exception:
+                    pass
+                speak_text(s)
             except Exception:
                 pass
-            buf = [token]
-        else:
-            buf.append(token)
+            continue
 
-    if not SPEECH_CANCEL.is_set() and buf:
-        try:
-            tts.speak(" ".join(buf))
-        except Exception:
-            pass
+        buf = []
+        for token in s.replace("\n", " ").split(" "):
+            if SPEECH_CANCEL.is_set():
+                break
+            if sum(len(x) for x in buf) + len(buf) + len(token) > chunk_size:
+                try:
+                    speak_text(" ".join(buf))
+                except Exception:
+                    pass
+                buf = [token]
+            else:
+                buf.append(token)
+
+        if not SPEECH_CANCEL.is_set() and buf:
+            try:
+                    try:
+                        ts = time.time()
+                        print(f"[TTS-INSTR][LLM] emit ts={ts:.3f} text='{(' '.join(buf))[:40]}'")
+                    except Exception:
+                        pass
+                    speak_text(" ".join(buf))
+            except Exception:
+                pass
+
+
+def speak_text(text: str, blocking: bool = False, timeout: float | None = None):
+    """Unified TTS helper that updates UI state around speech.
+
+    - Sets UI state to SPEAKING when starting.
+    - For blocking speech, calls speak_blocking and resets to IDLE afterwards.
+    - For non-blocking, queues the utterance and starts a background waiter
+      that calls `tts.flush()` and then resets UI to IDLE when queue empties.
+    """
+    if not text:
+        return
+
+    # SPEAKING UI is driven by the TTS on-start callback to reflect when audio
+    # actually begins (reduces perceived latency). Do not set SPEAKING eagerly.
+
+    try:
+        if blocking:
+            tts.speak_blocking(text, timeout=timeout)
+            try:
+                if MAIN_WINDOW and getattr(MAIN_WINDOW, 'state_manager', None):
+                    MAIN_WINDOW.state_manager.set_mode(UltronMode.IDLE)
+            except Exception:
+                pass
+            return
+
+        # non-blocking: queue and spawn a waiter to set IDLE after queue drains
+        tts.speak(text)
+        def _wait_and_idle():
+            try:
+                tts.flush(timeout=None)
+            except Exception:
+                pass
+            try:
+                if MAIN_WINDOW and getattr(MAIN_WINDOW, 'state_manager', None):
+                    MAIN_WINDOW.state_manager.set_mode(UltronMode.IDLE)
+            except Exception:
+                pass
+
+        thr = threading.Thread(target=_wait_and_idle, daemon=True)
+        thr.start()
+    except Exception:
+        pass
 
 # -------- Audio device-name extraction helpers --------
 _GENERIC_AUDIO_WORDS = {
@@ -299,7 +422,7 @@ MIC_LOCK = threading.Lock()
 # ===================== End Hotkey Guard =====================
 
 def _speak_ok_fail(ok: bool, ok_msg: str, fail_msg: str):
-    tts.speak(ok_msg if ok else fail_msg)
+    ultron_reply(ok_msg if ok else fail_msg)
 
 def handle_command(text: str):
     intent = parse_intent(text)
@@ -317,7 +440,7 @@ def handle_command(text: str):
             # Try opening as app first
             print(f"[Ultron] '{target}' looks like an app, trying open_app first...")
             if open_app(target):
-                tts.speak(f"Opening {target}.")
+                speak_text(f"Opening {target}.")
                 log_action("open_app", "success", target=target, source="open_site_fallback")
                 return
 
@@ -325,7 +448,7 @@ def handle_command(text: str):
         url = _ensure_url(target)
         say = f"Opening {url.replace('https://','').replace('http://','')}"
         print(f"[Ultron] {say}")
-        tts.speak_blocking(say, timeout=2.5)
+        speak_text(say, blocking=True, timeout=2.5)
         ok = open_url(url, browser_pref=BROWSER)
         log_action("open_site", "success" if ok else "failed", target=url)
         return
@@ -333,8 +456,12 @@ def handle_command(text: str):
     if intent.intent == "open_app" and isinstance(intent.entity, str):
         app = intent.entity.strip()
         said = f"Opening {app}"
-        print(f"[Ultron] {said}")
-        tts.speak_blocking(said, timeout=2.5)
+        # UI + speech: ensure UI shows the message first, then TTS speaks
+        try:
+            ui_say(said)
+        except Exception:
+            pass
+        speak_text(said, blocking=True, timeout=2.5)
 
         ok = False
 
@@ -354,7 +481,12 @@ def handle_command(text: str):
 
         log_action("open_app", "success" if ok else "failed", target=app)
         if not ok:
-            tts.speak(f"I couldn't find or launch {app} on this PC.")
+            err_msg = f"I couldn't find or launch {app} on this PC."
+            try:
+                ui_say(err_msg)
+            except Exception:
+                pass
+                speak_text(err_msg)
         return
 
     # ---------- Site Search ----------
@@ -378,38 +510,38 @@ def handle_command(text: str):
             )
             say_site = site or "the web"
             say_q = f" for {query}" if query else ""
-            tts.speak_blocking(f"Searching {say_site}{say_q}.", timeout=2.0)
+            speak_text(f"Searching {say_site}{say_q}.", blocking=True, timeout=2.0)
             log_action("site.search", "success" if ok else "failed",
                        site=site, query=query, target=url)
             if not ok:
-                tts.speak("I couldn't open the browser.")
+                speak_text("I couldn't open the browser.")
         except Exception as e:
             log_action("site.search", "error", site=site, query=query, error=str(e))
-            tts.speak("I couldn't perform that search.")
+            speak_text("I couldn't perform that search.")
         return
 
     # ---------- Calendar: Create event (Google Calendar) ----------
     if intent.intent == "calendar.create":
         if gcal_create_from_text is None:
-            tts.speak("Calendar support isn't available in this build.")
+            speak_text("Calendar support isn't available in this build.")
             log_action("calendar.create", "not_supported")
             return
         try:
             # Prefer the raw utterance so NLP can see everything
             command_text = (intent.entity or text or "").strip()
             print(f"[Ultron][Calendar] Creating from text: {command_text}")
-            tts.speak_blocking("Creating your event.", timeout=2.0)
+            speak_text("Creating your event.", blocking=True, timeout=2.0)
             result = gcal_create_from_text(command_text)
             ok = bool(result and result.get("ok"))
             msg = (result or {}).get("message") or ("Created the event." if ok else "I couldn't create the event.")
-            tts.speak(msg)
+            speak_text(msg)
             log_action(
                 "calendar.create",
                 "success" if ok else "failed",
                 **{k: v for k, v in (result or {}).items() if k in ("title", "start", "end", "link", "id", "message")}
             )
         except Exception as e:
-            tts.speak("I couldn't create that event.")
+            speak_text("I couldn't create that event.")
             log_action("calendar.create", "error", error=str(e))
         return
 
@@ -423,7 +555,15 @@ def handle_command(text: str):
         try:
             ok = sysctl.set_volume(pct)
         finally:
-            _speak_ok_fail(ok, f"Volume set to {pct} percent.", "Sorry, I couldn't change the volume.")
+            msg = f"Volume set to {pct} percent." if ok else "Sorry, I couldn't change the volume."
+            try:
+                ui_say(msg)
+            except Exception:
+                pass
+            try:
+                speak_text(msg)
+            except Exception:
+                pass
             log_action("volume_set", "success" if ok else "failed", target=pct)
         return
 
@@ -467,15 +607,15 @@ def handle_command(text: str):
                     for d in outs
                 ]
                 preview = ", ".join(names[:3]) + ("..." if len(names) > 3 else "")
-                tts.speak(f"Available outputs: {preview}.")
+                speak_text(f"Available outputs: {preview}.")
                 for i, d in enumerate(outs, 1):
                     print(f'[{i}] {d.get("name")} | state={d.get("state")} | default={d.get("default")} | id={d.get("id")}')
                 log_action("audio_list_outputs", "success", outputs=outs)
             else:
-                tts.speak("I couldn't list audio outputs.")
+                speak_text("I couldn't list audio outputs.")
                 log_action("audio_list_outputs", "failed")
         else:
-            tts.speak("Listing audio outputs isn't available on this build.")
+            speak_text("Listing audio outputs isn't available on this build.")
             log_action("audio_list_outputs", "not_supported")
         return
 
@@ -488,7 +628,7 @@ def handle_command(text: str):
                 requested = alt
 
         if not requested or requested.lower() in _GENERIC_AUDIO_WORDS:
-            tts.speak("Tell me the device name, like ‘switch audio to OnePlus Buds Z2’. You can also say ‘list audio outputs’.")
+            speak_text("Tell me the device name, like ‘switch audio to OnePlus Buds Z2’. You can also say ‘list audio outputs’.")
             log_action("audio_switch_output", "failed", requested=intent.entity, reason="no_device_name_extracted")
             return
 
@@ -501,7 +641,7 @@ def handle_command(text: str):
                 ok, info = False, "error"
 
         if ok:
-            tts.speak(f"Audio output set to {info}.")
+            speak_text(f"Audio output set to {info}.")
             log_action("audio_switch_output", "success", requested=requested, chosen=info)
             return
 
@@ -523,7 +663,7 @@ def handle_command(text: str):
                 best = None
 
             if best:
-                tts.speak(f"I found a paired device named {best}. Please connect it from Bluetooth settings; I’ll open it now.")
+                speak_text(f"I found a paired device named {best}. Please connect it from Bluetooth settings; I’ll open it now.")
                 if sysctl and hasattr(sysctl, "open_bluetooth_settings"):
                     try:
                         sysctl.open_bluetooth_settings()
@@ -533,11 +673,11 @@ def handle_command(text: str):
                 return
 
         if info in ("device_not_found", "no_devices"):
-            tts.speak("I couldn't find that audio device. Make sure it’s connected, then say ‘list audio outputs’ and try again.")
+            speak_text("I couldn't find that audio device. Make sure it’s connected, then say ‘list audio outputs’ and try again.")
         elif info == "not_supported":
-            tts.speak("Switching audio outputs isn't available on this build.")
+            speak_text("Switching audio outputs isn't available on this build.")
         else:
-            tts.speak("I couldn't switch the audio output.")
+            speak_text("I couldn't switch the audio output.")
         log_action("audio_switch_output", "failed", requested=requested, reason=info)
         return
 
@@ -616,21 +756,21 @@ def handle_command(text: str):
             ssid = st.get("ssid")
             signal = st.get("signal")
             if enabled is False:
-                tts.speak("Wi-Fi is off.")
+                speak_text("Wi-Fi is off.")
             elif state == "connected" and ssid:
                 if isinstance(signal, int):
-                    tts.speak(f"Connected to {ssid}, signal {signal} percent.")
+                    speak_text(f"Connected to {ssid}, signal {signal} percent.")
                 else:
-                    tts.speak(f"Connected to {ssid}.")
+                    speak_text(f"Connected to {ssid}.")
             elif state in ("disconnected", "disconnecting"):
-                tts.speak("Wi-Fi is on but not connected.")
+                speak_text("Wi-Fi is on but not connected.")
             elif enabled is True and state == "unknown":
-                tts.speak("Wi-Fi is on, status unknown.")
+                speak_text("Wi-Fi is on, status unknown.")
             else:
-                tts.speak("Wi-Fi status is unknown.")
+                speak_text("Wi-Fi status is unknown.")
             log_action("wifi_status", "success", **st)
         else:
-            tts.speak("Wi-Fi status isn't available on this build.")
+            speak_text("Wi-Fi status isn't available on this build.")
             log_action("wifi_status", "not_supported")
         return
 
@@ -644,7 +784,7 @@ def handle_command(text: str):
             _speak_ok_fail(ok, "Wi-Fi turned on.", "I couldn't turn Wi-Fi on.")
             log_action("wifi_on", "success" if ok else "failed")
         else:
-            tts.speak("Turning Wi-Fi on isn't available on this build.")
+            speak_text("Turning Wi-Fi on isn't available on this build.")
             log_action("wifi_on", "not_supported")
         return
 
@@ -658,7 +798,7 @@ def handle_command(text: str):
             _speak_ok_fail(ok, "Wi-Fi turned off.", "I couldn't turn Wi-Fi off.")
             log_action("wifi_off", "success" if ok else "failed")
         else:
-            tts.speak("Turning Wi-Fi off isn't available on this build.")
+            speak_text("Turning Wi-Fi off isn't available on this build.")
             log_action("wifi_off", "not_supported")
         return
 
@@ -672,7 +812,7 @@ def handle_command(text: str):
             _speak_ok_fail(ok, "Disconnected from Wi-Fi.", "I couldn't disconnect from Wi-Fi.")
             log_action("wifi_disconnect", "success" if ok else "failed")
         else:
-            tts.speak("Disconnecting from Wi-Fi isn't available on this build.")
+            speak_text("Disconnecting from Wi-Fi isn't available on this build.")
             log_action("wifi_disconnect", "not_supported")
         return
 
@@ -687,7 +827,7 @@ def handle_command(text: str):
             _speak_ok_fail(ok, f"Connecting to {ssid}.", f"I couldn't connect to {ssid}.")
             log_action("wifi_connect", "success" if ok else "failed", ssid=ssid)
         else:
-            tts.speak("Connecting to Wi-Fi networks isn't available on this build.")
+            speak_text("Connecting to Wi-Fi networks isn't available on this build.")
             log_action("wifi_connect", "not_supported", ssid=ssid)
         return
 
@@ -697,13 +837,50 @@ def handle_command(text: str):
         city = slots.get("city")
         when = slots.get("when") or "today"
         print(f"[Ultron][Weather][DBG] slots={slots} city={city!r} when={when!r}")
-        weather_skill.speak_weather_sync(tts, city, when)
-        log_action("weather.get", "success", city=city, when=when)
+        try:
+            w = weather_skill.get_weather_sync(city, when)
+
+            # Unit selection (match speak_weather_sync logic)
+            use_f = (weather_skill.UNITS == "imperial") or (
+                weather_skill.UNITS == "auto" and (w.location.endswith(", US") or "United States" in w.location)
+            )
+            unit = "degrees Fahrenheit" if use_f else "degrees Celsius"
+            temp_val = None
+            if isinstance(w.temp_c, (int, float)) and w.temp_c is not None and not (isinstance(w.temp_c, float) and (w.temp_c != w.temp_c)):
+                temp_val = round(w.temp_f) if use_f else round(w.temp_c)
+
+            when_spoken = w.when_label  # "today" | "tomorrow" | "yesterday" | "now"
+
+            if when_spoken in ("today", "tomorrow", "yesterday"):
+                if temp_val is not None:
+                    summary = f"In {w.location}, {when_spoken}, around {temp_val} {unit} with {w.description}."
+                else:
+                    summary = f"In {w.location}, {when_spoken}, conditions are {w.description}."
+            else:  # now
+                if temp_val is not None:
+                    summary = f"In {w.location} right now, it's {temp_val} {unit} with {w.description}."
+                else:
+                    summary = f"Sorry, I couldn't get the weather for {w.location} right now."
+
+            ultron_reply(summary)
+            log_action("weather.get", "success", city=city, when=when)
+        except Exception as e:
+            print(f"[Ultron][Weather] Error: {e!r}")
+            msg = str(e)
+            if isinstance(e, weather_skill.requests.RequestException):
+                ultron_reply("Weather ran into a network issue. Please check your internet connection.")
+            elif "Couldn't find location" in msg:
+                ultron_reply("I couldn't find that location. Please say the city name, like ‘weather in Hyderabad’.")
+            elif "No city set" in msg:
+                ultron_reply("Please set a default city in your dot env or say a city name.")
+            else:
+                ultron_reply("Weather ran into an issue. Please try again.")
+            log_action("weather.get", "failed", city=city, when=when, error=str(e))
         return
 
     # ---------- Power ----------
     if intent.intent == "power_sleep" and sysctl:
-        tts.speak("Going to sleep.")
+        speak_text("Going to sleep.")
         log_action("sleep", "issued")
         try:
             sysctl.sleep()
@@ -712,7 +889,7 @@ def handle_command(text: str):
         return
 
     if intent.intent == "power_shutdown" and sysctl:
-        tts.speak("Shutting down.")
+        speak_text("Shutting down.")
         log_action("shutdown", "issued")
         try:
             sysctl.shutdown()
@@ -721,7 +898,7 @@ def handle_command(text: str):
         return
 
     if intent.intent == "power_restart" and sysctl:
-        tts.speak("Restarting.")
+        speak_text("Restarting.")
         log_action("restart", "issued")
         try:
             sysctl.restart()
@@ -730,7 +907,7 @@ def handle_command(text: str):
         return
 
     if intent.intent == "power_lock" and sysctl:
-        tts.speak("Locked.")
+        speak_text("Locked.")
         log_action("lock", "issued")
         try:
             sysctl.lock()
@@ -745,10 +922,10 @@ def handle_command(text: str):
         except Exception as e:
             print(f"[Ultron][ERR] battery: {e}")
         if pct is None:
-            tts.speak("I couldn't read the battery level.")
+            speak_text("I couldn't read the battery level.")
             log_action("battery_query", "failed")
         else:
-            tts.speak(f"Battery at {pct} percent.")
+            speak_text(f"Battery at {pct} percent.")
             log_action("battery_query", "success", target=pct)
         return
 
@@ -783,45 +960,61 @@ def handle_command(text: str):
                 sysctl.reveal_in_explorer(path)
             except Exception:
                 pass
-        tts.speak("Screenshot saved in your Screenshots folder." if path else "I couldn't take a screenshot.")
+        speak_text("Screenshot saved in your Screenshots folder." if path else "I couldn't take a screenshot.")
         log_action("screenshot", "success" if path else "failed", target=path)
         return
 
     # ---------- Fallback: General question → Gemini ----------
     if ask_gemini is not None:
         print(f"[Ultron] Asking Gemini: {text}")
-        tts.speak("Let me check that for you.")
+        speak_text("Let me check that for you.")
         answer = ask_gemini(text)
         print(f"[Ultron] Gemini says: {answer}")
         log_event({"type": "action", "name": "ask_gemini", "query": text, "answer": answer})
         if isinstance(answer, str) and answer.startswith("Error contacting Gemini:"):
-            tts.speak("I couldn't reach Gemini right now.")
+            speak_text("I couldn't reach Gemini right now.")
             return
 
         # NEW: clear cancel flag before long read
         SPEECH_CANCEL.clear()
+        # Ensure UI shows Gemini answer before speaking
+        if isinstance(answer, str):
+            try:
+                ui_say(answer)
+            except Exception:
+                pass
+
         _speak_chunks(answer if isinstance(answer, str) else str(answer))
         return
 
     # ---------- Final fallback ----------
-    tts.speak("Try: ‘wifi status’, ‘extend my display’, ‘list audio outputs’, or ‘set volume to 50 percent’.")
+    speak_text("Try: ‘wifi status’, ‘extend my display’, ‘list audio outputs’, or ‘set volume to 50 percent’.")
     log_action("unknown", "no_intent")
 
 # -------- trigger paths --------
 def on_wake():
     log_debug("[Ultron] Listening (triggered)…")
-    # Audible wake ack (blocking so the user hears it once)
+    # Immediately show LISTENING so the UI reacts before any audio operations
     try:
-        # Use non-blocking voice ack to avoid delaying the mic capture
-        wake_ack(tts, blocking=True)
+        if MAIN_WINDOW and getattr(MAIN_WINDOW, 'state_manager', None):
+            MAIN_WINDOW.state_manager.set_mode(UltronMode.LISTENING)
     except Exception:
-        try:
-            tts.speak("Ultron is listening.")
-        except Exception:
-            pass
+        pass
+    # If Ultron is speaking, interrupt immediately (after showing LISTENING)
+    try:
+        stop_speaking()
+    except Exception:
+        pass
+
+    # Optional subtle wake beep instead of spoken ack
+    try:
+        if os.getenv("WAKE_BEEP", "1") == "1":
+            play_wake_sound()
+    except Exception:
+        pass
     # small pause to allow OS/device to settle after wake detection
     # Increase to 0.15s on Windows to avoid TTS blocking mic capture
-    time.sleep(0.15)
+    # NOTE: Removed artificial sleep to avoid added latency; do not pause here.
 
     # Try to acquire mic lock so we don't have concurrent captures
     try:
@@ -835,18 +1028,26 @@ def on_wake():
         log_debug("[Ultron] Capturing command...")
         try:
             cmd = listener.listen_once(timeout=10, phrase_time_limit=15)
+            # set UI to THINKING once we have captured speech
+            try:
+                if MAIN_WINDOW and getattr(MAIN_WINDOW, 'state_manager', None):
+                    MAIN_WINDOW.state_manager.set_mode(UltronMode.THINKING)
+            except Exception:
+                pass
         except Exception as e:
             print(f"[Ultron] Listener error: {e}")
             log_event({"type": "listen_error", "error": str(e)})
             try:
-                tts.speak("I had trouble hearing you.")
+                speak_text("I had trouble hearing you.")
             except Exception:
                 pass
             return
 
         if not cmd:
+            # Quietly return to idle
             try:
-                tts.speak("I didn't hear anything.")
+                if MAIN_WINDOW and getattr(MAIN_WINDOW, 'state_manager', None):
+                    MAIN_WINDOW.state_manager.set_mode(UltronMode.IDLE)
             except Exception:
                 pass
             log_event({"type": "listen_timeout"})
@@ -858,14 +1059,11 @@ def on_wake():
             MIC_LOCK.release()
         except Exception:
             pass
-    # ALWAYS execute command centrally first so runtime actions occur
-    try:
-        handle_command(cmd)
-    except Exception as _e:
-        print("[Ultron][ERR] handle_command failed:", _e)
-        traceback.print_exc()
-
-    # THEN notify UI (optional, non-blocking cosmetic update)
+    # Route the captured voice input through the UI input path so it behaves
+    # exactly like typing/hotkey input. Do NOT execute the command here when
+    # a UI is present — let the UI's InputRouter submit it (which calls
+    # `handle_command` centrally once). If there's no UI, fall back to direct
+    # execution for headless mode.
     try:
         if MAIN_WINDOW is not None:
             try:
@@ -873,6 +1071,12 @@ def on_wake():
                 MAIN_WINDOW.on_voice_recognized(cmd)
             except Exception as _e:
                 print("UI notify failed:", _e)
+        else:
+            try:
+                handle_command(cmd)
+            except Exception as _e:
+                print("[Ultron][ERR] handle_command failed:", _e)
+                traceback.print_exc()
     except Exception:
         pass
 
@@ -936,7 +1140,7 @@ def main():
     def _run_triggers():
         # Startup line (blocking so you hear it once) — run in background
         try:
-            tts.speak_blocking("Ultron is standing by.", timeout=2.5)
+            speak_text("Ultron is standing by.", blocking=True, timeout=2.5)
         except Exception:
             pass
 
@@ -1195,7 +1399,7 @@ def main():
             pass
 
         try:
-            tts.speak_blocking("Ultron shutting down.", timeout=3.0)
+            speak_text("Ultron shutting down.", blocking=True, timeout=3.0)
         except Exception:
             pass
         try:

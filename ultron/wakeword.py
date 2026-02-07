@@ -96,13 +96,12 @@ class WakeWordEngine:
                     break
 
                 if detected:
-                    time.sleep(0.50)  # give OS time to release device
                     try:
                         print("[Ultron][WakeWord] Detected by OpenWakeWord — calling on_wake()")
                         self.on_wake()
                     except Exception as e:
                         print(f"[Ultron][WakeWord] on_wake() raised: {e}")
-                    # loop to reopen stream & continue listening
+                    # loop to continue listening (do not sleep)
 
         self._thread = threading.Thread(target=runner, daemon=True)
         self._thread.start()
@@ -126,11 +125,14 @@ class WakeWordEngine:
         is_custom_model = os.path.isfile(kw) and kw.lower().endswith(".ppn")
 
         if is_custom_model:
-            porcupine = pvporcupine.create(
-                access_key=PORCUPINE_ACCESS_KEY,
-                keyword_paths=[kw],
-                sensitivities=[0.6],
-            )
+            try:
+                porcupine = pvporcupine.create(
+                    access_key=PORCUPINE_ACCESS_KEY,
+                    keyword_paths=[kw],
+                    sensitivities=[0.6],
+                )
+            except Exception as e:
+                raise RuntimeError(f"Porcupine init failed for custom model {kw!r}: {e}")
             shown = os.path.basename(kw)
         else:
             if kw.lower() not in builtin_keywords:
@@ -139,11 +141,14 @@ class WakeWordEngine:
                     f'Choose one of: {", ".join(sorted(builtin_keywords))}\n'
                     f'Or set WAKEWORD to a .ppn file path for your custom keyword.'
                 )
-            porcupine = pvporcupine.create(
-                access_key=PORCUPINE_ACCESS_KEY,
-                keywords=[kw.lower()],
-                sensitivities=[0.6],
-            )
+            try:
+                porcupine = pvporcupine.create(
+                    access_key=PORCUPINE_ACCESS_KEY,
+                    keywords=[kw.lower()],
+                    sensitivities=[0.6],
+                )
+            except Exception as e:
+                raise RuntimeError(f"Porcupine init failed for builtin keyword {kw!r}: {e}")
             shown = kw.lower()
 
         pa = pyaudio.PyAudio()
@@ -169,15 +174,7 @@ class WakeWordEngine:
                     pcm = np.frombuffer(pcm_bytes, dtype=np.int16)
                     result = porcupine.process(pcm)
                     if result >= 0:
-                        # Detected
-                        try:
-                            stream.stop_stream()
-                            stream.close()
-                        except Exception:
-                            pass
-
-                        time.sleep(0.50)  # let Windows release the device
-
+                        # Detected — don't close the stream or sleep; call on_wake() immediately
                         try:
                             print(f"[Ultron][WakeWord] Porcupine detected keyword (result={result}) — calling on_wake()")
                             self.on_wake()
@@ -186,7 +183,7 @@ class WakeWordEngine:
 
                         if self._stop.is_set():
                             break
-                        stream = open_stream()
+                        # keep the stream open and continue listening
             finally:
                 try:
                     if stream and stream.is_active():
