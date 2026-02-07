@@ -7,6 +7,7 @@ venv
 
 # Logs
 logs/
+data/
 
 # Add sensitive files to ignore list
 token_calendar.json

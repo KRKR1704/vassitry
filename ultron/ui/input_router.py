@@ -5,6 +5,7 @@ import time
 class InputRouter(QObject):
     submitted = Signal(str)
     system = Signal(str)
+    execute = Signal(str)
     """
     Routes all user inputs (chat, hotkeys, voice) into the CommandController.
     Responsibilities:
@@ -60,15 +61,12 @@ class InputRouter(QObject):
                 except Exception:
                     pass
 
-            # Forward to executor if provided (central runtime). Otherwise fall back to controller.
-            if self.command_executor:
-                try:
-                    self.command_executor(t)
-                except Exception as e:
-                    print("InputRouter: command_executor raised:", e)
-            else:
-                if self.controller:
-                    self.controller.submit(t)
+            # Forward to execution gate via signal only; MainWindow will
+            # schedule actual execution so the UI can paint the USER bubble first.
+            try:
+                self.execute.emit(t)
+            except Exception:
+                pass
 
             # record last submission
             self._last_text = t
@@ -77,3 +75,5 @@ class InputRouter(QObject):
         except Exception as e:
             # Keep router simple: don't crash the caller
             print("InputRouter.submit_text error:", e)
+
+    # Execution is now handled by MainWindow via the `execute` signal.
