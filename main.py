@@ -138,6 +138,23 @@ except Exception:
 
 # ==== NEW: global cancel flag + helper ========================================
 SPEECH_CANCEL = threading.Event()
+# Timestamp of last wake event (used to ignore immediate post-wake STT garbage)
+LAST_WAKE_TS = 0.0
+# How long after wake to ignore STT results (seconds)
+WAKE_IGNORE_SEC = 0.4
+
+
+def strip_wakeword(text: str) -> str:
+    """Strip common wakeword tokens from the start of a transcript.
+    Keeps case of the remainder and trims leading punctuation/spaces.
+    """
+    if not text:
+        return text
+    low = text.lower().strip()
+    for w in ["ultron"]:
+        if low.startswith(w):
+            return text[len(w):].strip(" ,.")
+    return text
 
 def stop_speaking():
     """Signal any ongoing TTS to stop ASAP."""
@@ -250,45 +267,51 @@ def _speak_chunks(text: str, chunk_size: int = 350):
     except Exception:
         sentences = [text]
 
+    # Buffering: hard caps to keep SAPI responsive
+    MAX_CHARS = 240
+    MAX_SENTENCES = 2
+
+    buf: list[str] = []
+    char_count = 0
+
     for s in sentences:
         if SPEECH_CANCEL.is_set():
             break
-        # If sentence is short enough, speak it whole; otherwise chunk by words
-        if len(s) <= chunk_size:
-            try:
-                try:
-                    ts = time.time()
-                    print(f"[TTS-INSTR][LLM] emit ts={ts:.3f} text='{s[:40]}'")
-                except Exception:
-                    pass
-                speak_text(s)
-            except Exception:
-                pass
+        s = s.strip()
+        if not s:
             continue
 
-        buf = []
-        for token in s.replace("\n", " ").split(" "):
-            if SPEECH_CANCEL.is_set():
-                break
-            if sum(len(x) for x in buf) + len(buf) + len(token) > chunk_size:
+        if (
+            char_count + len(s) > MAX_CHARS
+            or len(buf) >= MAX_SENTENCES
+        ):
+            try:
+                out = " ".join(buf)
                 try:
-                    speak_text(" ".join(buf))
+                    ts = time.time()
+                    print(f"[TTS-INSTR][LLM] emit ts={ts:.3f} text='{out[:40]}'")
                 except Exception:
                     pass
-                buf = [token]
-            else:
-                buf.append(token)
-
-        if not SPEECH_CANCEL.is_set() and buf:
-            try:
-                    try:
-                        ts = time.time()
-                        print(f"[TTS-INSTR][LLM] emit ts={ts:.3f} text='{(' '.join(buf))[:40]}'")
-                    except Exception:
-                        pass
-                    speak_text(" ".join(buf))
+                speak_text(out)
             except Exception:
                 pass
+            buf = [s]
+            char_count = len(s)
+        else:
+            buf.append(s)
+            char_count += len(s)
+
+    if not SPEECH_CANCEL.is_set() and buf:
+        try:
+            out = " ".join(buf)
+            try:
+                ts = time.time()
+                print(f"[TTS-INSTR][LLM] emit ts={ts:.3f} text='{out[:40]}'")
+            except Exception:
+                pass
+            speak_text(out)
+        except Exception:
+            pass
 
 
 def speak_text(text: str, blocking: bool = False, timeout: float | None = None):
@@ -993,6 +1016,8 @@ def handle_command(text: str):
 
 # -------- trigger paths --------
 def on_wake():
+    global LAST_WAKE_TS
+    LAST_WAKE_TS = time.time()
     log_debug("[Ultron] Listening (triggered)…")
     # Immediately show LISTENING so the UI reacts before any audio operations
     try:
@@ -1054,6 +1079,14 @@ def on_wake():
             return
 
         log_debug(f"[Ultron] Heard: {cmd}")
+        # Ignore immediate post-wake STT garbage for a short window
+        try:
+            now = time.time()
+            if (now - LAST_WAKE_TS) < WAKE_IGNORE_SEC:
+                log_debug("[Ultron] Ignoring immediate post-wake speech")
+                return
+        except Exception:
+            pass
     finally:
         try:
             MIC_LOCK.release()
@@ -1064,6 +1097,18 @@ def on_wake():
     # a UI is present — let the UI's InputRouter submit it (which calls
     # `handle_command` centrally once). If there's no UI, fall back to direct
     # execution for headless mode.
+    # Strip wakeword token (e.g. "Ultron ...") so handlers see the real command
+    try:
+        cmd = strip_wakeword(cmd)
+        if not cmd:
+            try:
+                if MAIN_WINDOW and getattr(MAIN_WINDOW, 'state_manager', None):
+                    MAIN_WINDOW.state_manager.set_mode(UltronMode.IDLE)
+            except Exception:
+                pass
+            return
+    except Exception:
+        pass
     try:
         if MAIN_WINDOW is not None:
             try:

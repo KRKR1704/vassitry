@@ -184,214 +184,37 @@ class _PowerShellTTS:
 # ---------- pyttsx3 backend ----------
 class _Pyttsx3TTS:
     def __init__(self):
-        # Do NOT create pyttsx3 engine on the main thread. Create it inside
-        # the worker thread and initialize COM (CoInitialize) there. This
-        # prevents cross-thread COM access violations observed as
-        # "Exception ignored in __del__" from comtypes.
         self._q: queue.Queue[_Utterance] = queue.Queue()
         self._stop = threading.Event()
-        self._cancel = threading.Event()
-        self._lock = threading.RLock()
+
+        # Control messages handled on the worker thread
+        self._cancel_req = threading.Event()
         self._engine = None
+        self._on_start = None
+
+        # how long to wait to collect more sentences into one runAndWait batch
+        self._batch_window_sec = 0.06
 
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
-        print("[Ultron][TTS] Backend: pyttsx3 (engine created in worker thread)")
+        print("[Ultron][TTS] Backend: pyttsx3 (COM + engine pinned to worker thread)")
         if TTS_STARTUP_TEST:
             self.speak("Text to speech is ready.")
 
-    def _clear_queue(self):
-        try:
-            while True:
-                self._q.get_nowait()
-                self._q.task_done()
-        except queue.Empty:
-            pass
-
-    def _run(self):
-        while not self._stop.is_set():
-            try:
-                utt = self._q.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            try:
-                # Notify any on-start listener just before running the engine
-                try:
-                    if hasattr(self, '_on_start') and callable(self._on_start):
-                        try:
-                            self._on_start()
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                with self._lock:
-                    self._engine.say(utt.text)
-                    self._engine.runAndWait()
-            except Exception as e:
-                print(f"[Ultron][TTS] Error speaking: {e}")
-            finally:
-                utt.done.set()
-                self._q.task_done()
-        # Initialize COM on this thread (Windows) before touching pyttsx3/SAPI
-        co_init = False
-        try:
-            if CoInitialize:
-                try:
-                    CoInitialize()
-                    co_init = True
-                except Exception:
-                    co_init = False
-        except Exception:
-            co_init = False
-
-        # Lazy-create the engine on this thread so COM objects live on the same
-        # thread that will use them.
-        try:
-            if pyttsx3 is None:
-                raise RuntimeError("pyttsx3 not available")
-            driver = "sapi5" if platform.system() == "Windows" else None
-            try:
-                self._engine = pyttsx3.init(driverName=driver)
-            except Exception:
-                self._engine = pyttsx3.init()
-
-            # Configure voice/rate/volume on the worker-thread engine
-            try:
-                voices = self._engine.getProperty("voices") or []
-                print("[Ultron][TTS] Available voices:")
-                for v in voices:
-                    print(f"  - id='{getattr(v,'id','')}' name='{getattr(v,'name','')}'")
-                if TTS_VOICE_NAME:
-                    chosen = None
-                    for v in voices:
-                        nm = (getattr(v, "name", "") or "").lower()
-                        vid = (getattr(v, "id", "") or "").lower()
-                        if TTS_VOICE_NAME.lower() in nm or TTS_VOICE_NAME.lower() in vid:
-                            chosen = v; break
-                    if chosen:
-                        try:
-                            self._engine.setProperty("voice", chosen.id)
-                            print(f"[Ultron][TTS] Using voice: {chosen.name or chosen.id}")
-                        except Exception:
-                            pass
-                try:
-                    base_rate = int(self._engine.getProperty("rate"))
-                    self._engine.setProperty("rate", max(80, base_rate + int(TTS_RATE)))
-                except Exception:
-                    pass
-                try:
-                    self._engine.setProperty("volume", max(0.0, min(1.0, float(TTS_VOLUME))))
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        except Exception as e:
-            print(f"[Ultron][TTS] pyttsx3 worker init failed: {e}")
-
-        try:
-            while not self._stop.is_set():
-                try:
-                    utt = self._q.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                try:
-                    # If cancel requested before starting, mark done and continue
-                    if self._cancel.is_set():
-                        try:
-                            # If engine exists, stop it from this thread
-                            if self._engine:
-                                try:
-                                    self._engine.stop()
-                                except Exception:
-                                    pass
-                        finally:
-                            self._cancel.clear()
-                            utt.done.set()
-                            self._q.task_done()
-                            continue
-
-                    # Instrument: mark when worker is about to start this utterance
-                    try:
-                        utt.started_ts = time.time()
-                        print(f"[TTS-INSTR][PY] start id={utt.id} ts={utt.started_ts:.3f} text='{(utt.text or '')[:30]}'")
-                    except Exception:
-                        pass
-                    # Notify any on-start listener just before running the engine
-                    try:
-                        if hasattr(self, '_on_start') and callable(self._on_start):
-                            try:
-                                self._on_start()
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-
-                    # Synthesize and block until utterance finishes — all engine
-                    # interaction happens on this worker thread to keep COM safe.
-                    if self._engine:
-                        try:
-                            with self._lock:
-                                self._engine.say(utt.text)
-                                self._engine.runAndWait()
-                        except Exception as e:
-                            print(f"[Ultron][TTS] Error speaking: {e}")
-                    else:
-                        # No engine: fallback to simple blocking powershell-style
-                        try:
-                            print("[Ultron][TTS] No pyttsx3 engine available for speaking.")
-                        except Exception:
-                            pass
-                except Exception as e:
-                    print(f"[Ultron][TTS] Error in worker: {e}")
-                finally:
-                    try:
-                        utt.done.set()
-                    except Exception:
-                        pass
-                    try:
-                        self._q.task_done()
-                    except Exception:
-                        pass
-        finally:
-            # Clean up engine and uninitialize COM on this thread
-            try:
-                if self._engine:
-                    try:
-                        self._engine.stop()
-                    except Exception:
-                        pass
-                    try:
-                        # pyttsx3 doesn't expose an explicit shutdown; deleting
-                        # the engine here prevents cross-thread GC issues.
-                        del self._engine
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            try:
-                if CoUninitialize and co_init:
-                    try:
-                        CoUninitialize()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+    def set_on_start(self, cb):
+        self._on_start = cb
 
     def speak(self, text: str):
-        if text:
-            utt = _Utterance(text)
-            try:
-                utt.enqueued_ts = time.time()
-                print(f"[TTS-INSTR][PY] enqueue id={utt.id} ts={utt.enqueued_ts:.3f} text='{text[:30]}'")
-            except Exception:
-                pass
-            self._q.put(utt)
-
-    def set_on_start(self, cb):
-        """Optional: set a callback invoked when speech actually begins."""
-        self._on_start = cb
+        if not text:
+            return
+        utt = _Utterance(text)
+        try:
+            utt.enqueued_ts = time.time()
+            print(f"[TTS-INSTR][PY] enqueue id={utt.id} ts={utt.enqueued_ts:.3f} text='{text[:30]}'")
+        except Exception:
+            pass
+        self._q.put(utt)
 
     def speak_blocking(self, text: str, timeout: float | None = None):
         if not text:
@@ -401,41 +224,189 @@ class _Pyttsx3TTS:
         utt.done.wait(timeout=timeout)
 
     def stop(self):
-        """Signal the worker to stop speaking and clear pending items.
-
-        Do NOT call engine methods from this thread — instead set a cancel
-        flag that the worker thread will observe and call engine.stop() on.
         """
+        Request stop ASAP. Do not touch engine here (wrong thread).
+        Worker will observe this and call engine.stop() safely.
+        """
+        self._cancel_req.set()
+        # Clear pending queue items so nothing "ghost speaks"
         try:
-            self._cancel.set()
-        except Exception:
+            while True:
+                u = self._q.get_nowait()
+                u.done.set()
+                self._q.task_done()
+        except queue.Empty:
             pass
-        self._clear_queue()
 
     def flush(self, timeout: float | None = None):
         start = time.time()
         while not self._q.empty():
             if timeout is not None and (time.time() - start) > timeout:
                 break
-            time.sleep(0.05)
+            time.sleep(0.02)
 
     def shutdown(self, timeout: float = 2.0):
+        # Request stop and exit
         self.stop()
         self._stop.set()
-        try:
-            self._engine.stop()
-        except Exception:
-            pass
-        # Request cancel and stop the worker loop; worker will cleanup engine
-        try:
-            self._cancel.set()
-        except Exception:
-            pass
-        self._stop.set()
         if self._worker.is_alive():
             self._worker.join(timeout=timeout)
-        if self._worker.is_alive():
-            self._worker.join(timeout=timeout)
+
+    def _init_engine_on_worker(self):
+        # COM must be initialized on this worker thread
+        co_init = False
+        if platform.system() == "Windows" and CoInitialize:
+            try:
+                CoInitialize()
+                co_init = True
+            except Exception:
+                co_init = False
+
+        if pyttsx3 is None:
+            raise RuntimeError("pyttsx3 not available")
+
+        driver = "sapi5" if platform.system() == "Windows" else None
+        try:
+            eng = pyttsx3.init(driverName=driver)
+        except Exception:
+            eng = pyttsx3.init()
+
+        # Configure voice/rate/volume on worker thread
+        try:
+            voices = eng.getProperty("voices") or []
+            if TTS_VOICE_NAME:
+                chosen = None
+                want = TTS_VOICE_NAME.lower()
+                for v in voices:
+                    nm = (getattr(v, "name", "") or "").lower()
+                    vid = (getattr(v, "id", "") or "").lower()
+                    if want in nm or want in vid:
+                        chosen = v
+                        break
+                if chosen:
+                    try:
+                        eng.setProperty("voice", chosen.id)
+                    except Exception:
+                        pass
+            try:
+                base_rate = int(eng.getProperty("rate"))
+                eng.setProperty("rate", max(80, base_rate + int(TTS_RATE)))
+            except Exception:
+                pass
+            try:
+                eng.setProperty("volume", max(0.0, min(1.0, float(TTS_VOLUME))))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        return eng, co_init
+
+    def _run(self):
+        # Initialize engine once, here, on the worker thread
+        co_init = False
+        try:
+            self._engine, co_init = self._init_engine_on_worker()
+        except Exception as e:
+            print(f"[Ultron][TTS] pyttsx3 init failed: {e}")
+            self._engine = None
+
+        try:
+            while not self._stop.is_set():
+                # Wait for first utterance
+                try:
+                    first = self._q.get(timeout=0.1)
+                except queue.Empty:
+                    # Still honor cancel requests even if idle
+                    if self._cancel_req.is_set() and self._engine:
+                        try:
+                            self._engine.stop()
+                        except Exception:
+                            pass
+                        self._cancel_req.clear()
+                    continue
+
+                if not self._engine:
+                    # No engine: just mark done and continue
+                    first.done.set()
+                    self._q.task_done()
+                    continue
+
+                # If cancel was requested, stop engine and skip this batch
+                if self._cancel_req.is_set():
+                    try:
+                        self._engine.stop()
+                    except Exception:
+                        pass
+                    self._cancel_req.clear()
+                    first.done.set()
+                    self._q.task_done()
+                    continue
+
+                # Batch: collect more utterances for a short window
+                batch = [first]
+                t0 = time.time()
+                while (time.time() - t0) < self._batch_window_sec:
+                    try:
+                        nxt = self._q.get_nowait()
+                        batch.append(nxt)
+                    except queue.Empty:
+                        time.sleep(0.005)
+
+                # Notify "audio is about to start" once per batch
+                try:
+                    if callable(self._on_start):
+                        self._on_start()
+                except Exception:
+                    pass
+
+                # Queue all text, then run once (reduces gaps)
+                try:
+                    for utt in batch:
+                        try:
+                            utt.started_ts = time.time()
+                            print(f"[TTS-INSTR][PY] start id={utt.id} ts={utt.started_ts:.3f} text='{(utt.text or '')[:30]}'")
+                        except Exception:
+                            pass
+                        self._engine.say(utt.text)
+                    self._engine.runAndWait()
+                except Exception as e:
+                    print(f"[Ultron][TTS] speak batch error: {e}")
+                    try:
+                        self._engine.stop()
+                    except Exception:
+                        pass
+                finally:
+                    for utt in batch:
+                        utt.done.set()
+                        self._q.task_done()
+
+                # If cancel was requested mid-speech, stop now
+                if self._cancel_req.is_set():
+                    try:
+                        self._engine.stop()
+                    except Exception:
+                        pass
+                    self._cancel_req.clear()
+
+        finally:
+            # Cleanup must happen on this worker thread
+            try:
+                if self._engine:
+                    try:
+                        self._engine.stop()
+                    except Exception:
+                        pass
+                    try:
+                        self._engine = None
+                    except Exception:
+                        pass
+            finally:
+                if platform.system() == "Windows" and CoUninitialize and co_init:
+                    try:
+                        CoUninitialize()
+                    except Exception:
+                        pass
 
 # ---------- Unified facade ----------
 class TTS:
